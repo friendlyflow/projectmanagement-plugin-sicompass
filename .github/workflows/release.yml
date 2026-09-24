@@ -38,7 +38,7 @@ jobs:
         # this plugin builds against.
         run: |
           nix develop -c cargo install --git https://github.com/friendlyflow/sicompass-plugin-sdk \
-            --rev a9f333a0cc5a979ff16d349ab19a1207d6a5a3fe sicompass-plugin --root "$RUNNER_TEMP/tool"
+            --rev 2dfa61046e341fa2ad8c5bfd495fee8e024439a5 sicompass-plugin --root "$RUNNER_TEMP/tool"
           echo "SICOMPASS_PLUGIN=$RUNNER_TEMP/tool/bin/sicompass-plugin" >> "$GITHUB_ENV"
 
       - name: Build, pack, sign, verify
