@@ -741,7 +741,7 @@ dependencies = [
 [[package]]
 name = "sicompass-payments"
 version = "0.2.0"
-source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=2dfa61046e341fa2ad8c5bfd495fee8e024439a5#2dfa61046e341fa2ad8c5bfd495fee8e024439a5"
+source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=942ac5fb925cd0ab301e41df60acfd7f84c2d54e#942ac5fb925cd0ab301e41df60acfd7f84c2d54e"
 dependencies = [
  "serde",
  "serde_json",
@@ -751,16 +751,17 @@ dependencies = [
 [[package]]
 name = "sicompass-pdk"
 version = "0.5.0"
-source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=2dfa61046e341fa2ad8c5bfd495fee8e024439a5#2dfa61046e341fa2ad8c5bfd495fee8e024439a5"
+source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=942ac5fb925cd0ab301e41df60acfd7f84c2d54e#942ac5fb925cd0ab301e41df60acfd7f84c2d54e"
 dependencies = [
  "sicompass-sdk",
- "wit-bindgen",
+ "wasip2",
+ "wit-bindgen 0.60.0",
 ]
 
 [[package]]
 name = "sicompass-sdk"
 version = "0.8.0"
-source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=2dfa61046e341fa2ad8c5bfd495fee8e024439a5#2dfa61046e341fa2ad8c5bfd495fee8e024439a5"
+source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=942ac5fb925cd0ab301e41df60acfd7f84c2d54e#942ac5fb925cd0ab301e41df60acfd7f84c2d54e"
 dependencies = [
  "async-trait",
  "scraper",
@@ -929,6 +930,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
+name = "wasip2"
+version = "1.0.4+wasi-0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "wasm-encoder"
 version = "0.254.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -987,6 +997,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "wit-bindgen"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+dependencies = [
+ "bitflags",
 ]
 
 [[package]]
