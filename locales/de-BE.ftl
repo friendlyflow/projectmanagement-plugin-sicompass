@@ -5,48 +5,64 @@
 
 projectmanagement-display-name = projektverwaltung
 
-pm-empty-columns = noch keine spalten, drücken sie strg+a um eine hinzuzufügen
-pm-empty-cards = noch keine karten, drücken sie strg+a um eine hinzuzufügen
+projectmanagement-empty-columns = noch keine spalten, drücken sie strg+a um eine hinzuzufügen
+projectmanagement-empty-cards = noch keine karten, drücken sie strg+a um eine hinzuzufügen
 
-pm-cmd-move-up = nach oben verschieben
-pm-cmd-move-down = nach unten verschieben
-pm-cmd-move-left = in die vorige spalte verschieben
-pm-cmd-move-right = in die nächste spalte verschieben
-pm-cmd-archive-card = karte archivieren
+projectmanagement-cmd-move-up = nach oben verschieben
+projectmanagement-cmd-move-down = nach unten verschieben
+projectmanagement-cmd-move-left = in die vorige spalte verschieben
+projectmanagement-cmd-move-right = in die nächste spalte verschieben
+projectmanagement-cmd-archive-card = karte archivieren
 
 # The settings checkbox that turns on mirroring the board to the server.
-pm-checkbox-cloud-backup = Cloud-Sicherung aktivieren
+projectmanagement-checkbox-cloud-backup = Cloud-Sicherung aktivieren
 
-pm-error-unreadable = ihr board konnte nicht gelesen werden, daher wurde nichts gespeichert, die dateien auf der festplatte bleiben unberührt
-pm-error-save = ihr board konnte nicht gespeichert werden
-pm-error-no-column = fügen sie zuerst eine spalte hinzu, eine karte gehört in eine spalte
-pm-error-nothing-to-paste = es wurde noch nichts kopiert
+projectmanagement-error-unreadable = ihr board konnte nicht gelesen werden, daher wurde nichts gespeichert, die dateien auf der festplatte bleiben unberührt
+projectmanagement-error-save = ihr board konnte nicht gespeichert werden
+projectmanagement-error-no-column = fügen sie zuerst eine spalte hinzu, eine karte gehört in eine spalte
+projectmanagement-error-nothing-to-paste = es wurde noch nichts kopiert
 
-pm-board-empty-slot = drücken Sie strg+a für eine erste karte
-pm-board-no-columns = noch keine spalten, fügen Sie eine in der liste mit strg+a hinzu
+projectmanagement-board-empty-slot = drücken Sie strg+a für eine erste karte
+projectmanagement-board-no-columns = noch keine spalten, fügen Sie eine in der liste mit strg+a hinzu
 
 # Der Titel der Archivspalte bei ihrer Erstellung. Nur ein Name: die Spalte
 # wird über ihre id erkannt, Umbenennen ändert daran nichts.
-pm-archive-title = Archiv
+projectmanagement-archive-title = Archiv
 
-pm-say-card = { $column }, karte { $index } von { $total }, { $text }
-pm-say-column-empty = spalte { $index } von { $total }, { $title }, leer
-pm-say-insert = einfügemodus, { $text }
-pm-say-insert-empty = einfügemodus, leer
-pm-say-board = boardmodus
-pm-say-deleted = gelöscht, { $text }
-pm-say-copied = kopiert, { $text }
-pm-say-cut = ausgeschnitten, { $text }
-pm-say-pasted = eingefügt, { $text }
-pm-say-archived = archiviert, { $text }
-pm-say-nothing-to-archive = nichts zu archivieren, setzen Sie den cursor zuerst auf eine karte
-pm-say-already-archived = bereits archiviert
-pm-say-undone = rückgängig gemacht, { $what }
-pm-say-redone = wiederhergestellt, { $what }
-pm-say-edge = nicht weiter
+projectmanagement-say-card = { $column }, karte { $index } von { $total }, { $text }
+projectmanagement-say-column-empty = spalte { $index } von { $total }, { $title }, leer
+projectmanagement-say-insert = einfügemodus, { $text }
+projectmanagement-say-insert-empty = einfügemodus, leer
+projectmanagement-say-board = boardmodus
+projectmanagement-say-deleted = gelöscht, { $text }
+projectmanagement-say-copied = kopiert, { $text }
+projectmanagement-say-cut = ausgeschnitten, { $text }
+projectmanagement-say-pasted = eingefügt, { $text }
+projectmanagement-say-archived = archiviert, { $text }
+projectmanagement-say-nothing-to-archive = nichts zu archivieren, setzen Sie den cursor zuerst auf eine karte
+projectmanagement-say-already-archived = bereits archiviert
+projectmanagement-say-undone = rückgängig gemacht, { $what }
+projectmanagement-say-redone = wiederhergestellt, { $what }
+projectmanagement-say-edge = nicht weiter
 
-pm-op-add-card = karte hinzufügen
-pm-op-delete-card = karte löschen
-pm-op-rename-card = karte umbenennen
-pm-op-move-card = karte verschieben
-pm-op-archive-card = karte archivieren
+projectmanagement-op-add-card = karte hinzufügen
+projectmanagement-op-delete-card = karte löschen
+projectmanagement-op-rename-card = karte umbenennen
+projectmanagement-op-move-card = karte verschieben
+projectmanagement-op-archive-card = karte archivieren
+
+projectmanagement-description = Ein Kanban-Board, das Sie in einer Liste oder auf einem Raster ordnen, mit optionaler Cloud-Sicherung.
+projectmanagement-service = bewahrt eine Kopie Ihres Boards auf dem Server von Sicompass Cloud auf
+
+projectmanagement-cloud-needs-payment = Cloud-Sicherung: braucht Sicompass Cloud, siehe store, Abos
+projectmanagement-cloud-active = Cloud-Sicherung: an, verlängert sich in { $days } Tagen
+projectmanagement-cloud-grace = Cloud-Sicherung: Abo abgelaufen, noch { $days } Tage an, verlängern Sie in store, Abos
+projectmanagement-cloud-expired = Cloud-Sicherung: aus, das Abo ist vor { $days } Tagen abgelaufen, siehe store, Abos
+projectmanagement-cloud-needs-subscription = die Cloud-Sicherung braucht Sicompass Cloud, siehe store, Abos
+projectmanagement-cloud-failed = Cloud-Sicherung fehlgeschlagen: { $reason }
+projectmanagement-error-cloud-row-undeletable = die Zeile der Cloud-Sicherung ist keine Spalte, schalten Sie die Cloud-Sicherung in den Einstellungen aus, um sie zu entfernen
+
+projectmanagement-cmd-restore-backup = Cloud-Sicherung wiederherstellen
+projectmanagement-restore-done = Cloud-Sicherung wiederhergestellt
+projectmanagement-restore-empty = es gibt keine Cloud-Sicherung zum Wiederherstellen
+projectmanagement-restore-refused = Ihr Board ist nicht leer, es wurde nichts wiederhergestellt

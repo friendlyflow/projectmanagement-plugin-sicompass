@@ -1,4 +1,8 @@
-//! The project-management provider. Its first feature is a kanban board.
+//! The project-management plugin. Its first feature is a kanban board.
+//!
+//! A sicompass WASM plugin. The board lives in the plugin's own folder
+//! (`"storage": true`, which the host maps to the same directory the built-in
+//! used, so nothing moves), and the optional cloud backup is in [`cloud`].
 //!
 //! # Two surfaces, one board
 //!
@@ -58,77 +62,31 @@
 //! by mutating the app's FFON tree and calling back into
 //! `sync_ffon_body_children`. A board edit never touches that tree, so those arms
 //! could not reverse one even if they were recorded. Board edits therefore emit
-//! `TimelineEntry::ProviderOp` and are reversed here, in [`Provider::undo`]. Both
+//! a `ProviderOp` and are reversed here, in [`Plugin::undo`]. Both
 //! kinds land on the same per-tab timeline in the order they happened, so there
 //! is still one undo history rather than a board-shaped exception to it.
 
 pub mod board;
+pub mod cloud;
 mod escape;
+pub mod localize;
 pub mod render;
 pub mod store;
 
+use cloud::{Cloud, CloudHost, Finished, PluginHost};
 use serde::{Deserialize, Serialize};
+use sicompass_pdk::{
+    DashboardKind, DashboardRequest, Descriptor, Key, Keysym, NavigationRequest, Plugin,
+    PollResult, ProviderOp, TaskEvent, export_plugin,
+};
 use sicompass_sdk::ffon::FfonElement;
 use sicompass_sdk::input::{self, InputLine, InputState};
-use sicompass_sdk::timeline::TimelineEntry;
-use sicompass_sdk::{
-    BuiltinManifest, DashboardFrame, DashboardKey, DashboardKeysym, DashboardKind,
-    DashboardRequest, NavigationRequest, Provider, SettingDecl, localize,
-    register_builtin_manifest, register_provider_factory, tags,
-};
+use sicompass_sdk::tags;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use board::{Board, Card, Column, Id};
 use render::{Focus, View};
-
-// ---------------------------------------------------------------------------
-// Test stub: never touch the user's real board from a test.
-//
-// The failure this prevents is not a flaky test, it is data loss. `save_board`
-// reconciles a directory against a board, so a test that builds a two-column
-// board and saves it to the real board directory does not add two columns — it
-// deletes everything else.
-//
-// Two audiences, hence a compile-time default and a runtime setter:
-//
-// * This crate's own unit tests get it free from `cfg!(test)`. Setting the
-//   per-instance `root_override` is the right way to make a test safe, but
-//   forgetting it must fail closed rather than silently reaching the real store.
-// * The app's integration tests are a different binary, where this crate is an
-//   ordinary dependency compiled *without* `cfg(test)`, and they reach the
-//   provider as a `Box<dyn Provider>` with no way to set the override. They call
-//   `_set_test_no_persist(true)` once per binary instead.
-// ---------------------------------------------------------------------------
-
-static TEST_NO_PERSIST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(cfg!(test));
-
-#[doc(hidden)]
-pub fn _set_test_no_persist(enabled: bool) {
-    TEST_NO_PERSIST.store(enabled, std::sync::atomic::Ordering::Release);
-}
-
-#[inline]
-fn test_no_persist() -> bool {
-    TEST_NO_PERSIST.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Register this crate's Fluent bundles. Idempotent.
-///
-/// Called from `register()` *and* from every trait method that resolves a
-/// string: a factory-built provider is reachable before `register()` on some
-/// paths, and an unresolved key renders as the key itself.
-pub fn register_translations() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Command ids
@@ -156,12 +114,6 @@ pub const CMD_MOVE_RIGHT: &str = "move right";
 pub const CMD_ARCHIVE: &str = "archive card";
 pub const CMD_RESTORE_BACKUP: &str = "restore cloud backup";
 
-/// Server-side name of this store, and the `settings.json` key for its cloud
-/// backup switch. The store is called "kanban" on the server because that is
-/// what it holds; the provider keeps its longer name.
-const CLOUD_PLUGIN: &str = "kanban";
-const CLOUD_ENABLE_KEY: &str = "kanbanCloudBackup";
-
 // ---------------------------------------------------------------------------
 // Board operations, as they cross the timeline
 // ---------------------------------------------------------------------------
@@ -180,7 +132,7 @@ struct CardData {
 /// `Structural` entries — the board has no gesture that reaches a column, so it
 /// has no column op to record.
 ///
-/// Carried in a `TimelineEntry::ProviderOp` as JSON in the payload rather than as
+/// Carried in a `ProviderOp` as JSON in the payload rather than as
 /// a tagged FFON shape: the app never inspects it, only hands it back, so a
 /// self-describing blob keeps the wire format in one place instead of spreading
 /// it across the FFON encoder.
@@ -223,7 +175,7 @@ enum BoardOp {
 }
 
 impl BoardOp {
-    /// The stable command id, also the label key suffix (`pm-op-{id}`).
+    /// The stable command id, also the label key suffix (`projectmanagement-op-{id}`).
     ///
     /// Spelled out rather than derived from the variant name: these strings
     /// reach the user through the undo-history screen, so renaming a variant
@@ -292,18 +244,22 @@ pub struct ProjectManagementProvider {
     /// Displayed label back to the id it names, per level. `push_path` is handed
     /// the label the user was looking at, not an id.
     labels: HashMap<Option<Id>, HashMap<String, Id>>,
+    /// Per-instance store location, for the tests. Inside the sandbox the
+    /// store is the plugin's own folder, `/storage`.
     root_override: Option<PathBuf>,
     loaded: bool,
     load_failed: bool,
     error: Option<String>,
     announcement: Option<String>,
     refresh: bool,
-    timeline: Vec<TimelineEntry>,
+    timeline: Vec<ProviderOp>,
     /// Text taken by `commit_edit` for a row the app has not told us about yet.
     pending_create: Option<String>,
-    /// Opt-in mirror of the board to the license server. Inert until the user
-    /// ticks "enable cloud backup" in settings; see `lib_payments::cloud`.
-    cloud: sicompass_payments::cloud::CloudBackup,
+    /// Opt-in mirror of the board to Sicompass Cloud. Inert until the user
+    /// ticks "enable cloud backup" in the board's settings; see [`cloud`].
+    cloud: Cloud,
+    /// The host calls the cloud needs, injectable so the tests run natively.
+    host: Box<dyn CloudHost>,
 
     // ---- Dashboard ------------------------------------------------------
     mode: BoardMode,
@@ -339,14 +295,8 @@ pub struct ProjectManagementProvider {
     in_dashboard: bool,
 }
 
-impl Default for ProjectManagementProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ProjectManagementProvider {
-    pub fn new() -> Self {
+    pub fn with_host(host: Box<dyn CloudHost>) -> Self {
         ProjectManagementProvider {
             board: Board::new(),
             open_column: None,
@@ -360,7 +310,8 @@ impl ProjectManagementProvider {
             refresh: false,
             timeline: Vec::new(),
             pending_create: None,
-            cloud: sicompass_payments::cloud::CloudBackup::new(CLOUD_PLUGIN, CLOUD_ENABLE_KEY),
+            cloud: Cloud::new(cloud::SERVICE),
+            host,
             mode: BoardMode::Board,
             focus: Focus::default(),
             edit: None,
@@ -375,20 +326,79 @@ impl ProjectManagementProvider {
         }
     }
 
+    /// Point the store somewhere else (the tests use a temporary directory).
+    pub fn set_root(&mut self, path: PathBuf) {
+        self.root_override = Some(path);
+        self.loaded = false;
+        self.load_failed = false;
+    }
+
     /// Where the board lives. `None` means nowhere usable, and the board stays in
     /// memory for the session rather than being silently discarded.
     ///
-    /// Deliberately `data_home()` and not `state_home()`: on macOS the latter is
-    /// `~/Library/Logs`, which the OS and every cleanup tool treat as disposable.
-    /// A board is a document.
+    /// In the sandbox that is `/storage`, which the host maps to the plugin's
+    /// own folder in the data directory (not the state directory: on macOS that
+    /// is `~/Library/Logs`, which cleanup tools treat as disposable, and a board
+    /// is a document). Natively, in the unit tests, nothing unless a test set
+    /// one: a test that forgot must fail closed, never reach a real board.
     fn root(&self) -> Option<PathBuf> {
         if let Some(p) = &self.root_override {
             return Some(p.clone());
         }
-        if test_no_persist() {
-            return None;
-        }
-        sicompass_sdk::platform::app_data_dir().map(|d| d.join("projectmanagement"))
+        cfg!(target_arch = "wasm32").then(|| PathBuf::from(sicompass_pdk::STORAGE_DIR))
+    }
+
+    pub fn at_root(&self) -> bool {
+        self.open_column.is_none()
+    }
+
+    pub fn needs_refresh(&self) -> bool {
+        self.refresh || self.cloud.needs_refresh()
+    }
+
+    pub fn clear_needs_refresh(&mut self) {
+        self.refresh = false;
+        self.cloud.clear_needs_refresh();
+    }
+
+    pub fn take_error(&mut self) -> Option<String> {
+        // The board's own error leads: a board that could not be saved matters
+        // more than a backup that could not be uploaded.
+        self.error.take().or_else(|| self.cloud.take_error())
+    }
+
+    pub fn take_announcement(&mut self) -> Option<String> {
+        self.announcement
+            .take()
+            .or_else(|| self.cloud.take_announcement())
+    }
+
+    pub fn take_dashboard_request(&mut self) -> Option<DashboardRequest> {
+        self.dashboard_request.take()
+    }
+
+    pub fn take_navigation_request(&mut self) -> Option<NavigationRequest> {
+        self.navigation.take()
+    }
+
+    /// The board, drawn at `cols` by `rows`, in the renderer's own types.
+    pub fn render_frame(&mut self, cols: u16, rows: u16) -> sicompass_sdk::DashboardFrame {
+        self.ensure_loaded();
+        self.clamp_focus();
+        self.board_cols = cols;
+        let editing = self.edit.as_ref().map(|e| (e.text.as_str(), e.caret));
+        // Resolved here rather than inside the renderer: `render` is pure drawing
+        // and has no business reaching the localizer.
+        let empty_label = localize::t("projectmanagement-board-empty-slot");
+        let no_columns_label = localize::t("projectmanagement-board-no-columns");
+        let view = View {
+            focus: self.focus,
+            editing,
+            empty_label: &empty_label,
+            no_columns_label: &no_columns_label,
+            palette: self.palette,
+        };
+        render::render(&self.board, &view, cols, rows)
     }
 
     fn ensure_loaded(&mut self) {
@@ -421,33 +431,23 @@ impl ProjectManagementProvider {
                 // save would reconcile the directory against a board that failed
                 // to load and delete what could not be read.
                 self.load_failed = true;
-                self.error = Some(localize::t("pm-error-unreadable"));
+                self.error = Some(localize::t("projectmanagement-error-unreadable"));
             }
         }
     }
 
     /// Pull the cloud backup back over an empty board.
     ///
-    /// The outcome is spoken rather than returned: "nothing was restored" and
-    /// "restored" both need saying, and only one of them is an error.
+    /// A background task. Its outcome is spoken when it ends
+    /// ([`Plugin::on_task_event`]): "nothing was restored" and "restored" both
+    /// need saying, and only one of them is an error. A board with columns is
+    /// refused here already, before anything reaches the network.
     fn restore_cloud_backup(&mut self) {
-        let Some(root) = self.root() else {
+        if !self.board.columns.is_empty() || self.load_failed {
+            self.cloud.refuse_restore(&*self.host);
             return;
-        };
-        match self.cloud.restore(&root) {
-            Ok((restored, message)) => {
-                if restored {
-                    // The board in memory is now stale: re-read what was just
-                    // written.
-                    self.loaded = false;
-                    self.load_failed = false;
-                    self.ensure_loaded();
-                    self.refresh = true;
-                }
-                self.say(message);
-            }
-            Err(e) => self.error = Some(e),
         }
+        self.cloud.start_restore(&*self.host);
     }
 
     fn persist(&mut self) {
@@ -458,13 +458,13 @@ impl ProjectManagementProvider {
             return;
         };
         if store::save_board(&root, &self.board).is_err() {
-            self.error = Some(localize::t("pm-error-save"));
+            self.error = Some(localize::t("projectmanagement-error-save"));
             // The disk write failed, so there is no new state worth mirroring.
             return;
         }
-        // Queues only. Every board edit lands here, so the upload itself
-        // belongs to the worker in `lib_payments::cloud`.
-        self.cloud.mark_dirty(&root);
+        // Queues only. Every board edit lands here, so the upload itself is a
+        // background task, started from `poll` once the board is quiet.
+        self.cloud.mark_dirty(&*self.host);
     }
 
     // ---- Row rendering --------------------------------------------------
@@ -514,7 +514,7 @@ impl ProjectManagementProvider {
         // per provider, in one place. The board itself is listed below it
         // whether or not the subscription is paid for.
         if level.is_none()
-            && let Some(row) = self.cloud.row()
+            && let Some(row) = cloud::row(&self.cloud, &*self.host)
         {
             out.push(row);
         }
@@ -536,9 +536,9 @@ impl ProjectManagementProvider {
         // would otherwise lose its "no columns yet" line.
         if rows_len == 0 {
             out.push(FfonElement::new_str(localize::t(if level.is_none() {
-                "pm-empty-columns"
+                "projectmanagement-empty-columns"
             } else {
-                "pm-empty-cards"
+                "projectmanagement-empty-cards"
             })));
         }
         out
@@ -560,11 +560,7 @@ impl ProjectManagementProvider {
     /// and a node whose row is gone was deleted. Order is the order the app gave.
     fn reconcile(&mut self, children: &[FfonElement]) {
         if self.load_failed {
-            self.error = Some(localize::t("pm-error-unreadable"));
-            return;
-        }
-        // Not our list: see `is_grafted_page`.
-        if sicompass_payments::cloud::is_grafted_page(children) {
+            self.error = Some(localize::t("projectmanagement-error-unreadable"));
             return;
         }
 
@@ -572,8 +568,8 @@ impl ProjectManagementProvider {
         // whatever it was displaying, so without this the "no columns yet" line
         // would become the user's first column the moment they made a second.
         let rendered_only = [
-            localize::t("pm-empty-columns"),
-            localize::t("pm-empty-cards"),
+            localize::t("projectmanagement-empty-columns"),
+            localize::t("projectmanagement-empty-cards"),
         ];
 
         // Which list is this? Not necessarily the one the cursor is on: undo and
@@ -613,12 +609,12 @@ impl ProjectManagementProvider {
             if rendered_only.iter().any(|r| r == raw) {
                 continue;
             }
-            // The cloud row is rendered, never stored. Matched by "carries a
-            // link" rather than by text, because its wording changes with the
-            // subscription and with the user's language. Safe here because
-            // `escape` puts a card's own angle brackets beyond reach, so no
-            // column and no card can ever carry a real `<link>`.
-            if sicompass_payments::cloud::CloudBackup::is_row(raw) {
+            // The cloud row is rendered, never stored. Matched by its `<id>`
+            // rather than by text, because its wording changes with the
+            // subscription and with the user's language. No column can claim
+            // that id: column ids are numbers, and `row_id` reads only the
+            // prefix this plugin wrote.
+            if cloud::is_row(raw) {
                 continue;
             }
             let text = column_title(&row_text(raw));
@@ -713,14 +709,11 @@ impl ProjectManagementProvider {
     // ---- Board mutation, with a timeline entry --------------------------
 
     fn record(&mut self, op: BoardOp) {
-        let label = localize::t(&format!("pm-op-{}", op.command()));
+        let label = localize::t(&format!("projectmanagement-op-{}", op.command()));
         let payload = serde_json::to_string(&op).unwrap_or_default();
-        self.timeline.push(TimelineEntry::ProviderOp {
-            // Patched by the app: `drain_provider_entries` rewrites it to the
-            // originating provider's real index, which this crate cannot know.
-            provider_idx: 0,
+        self.timeline.push(ProviderOp {
             command: op.command().to_owned(),
-            payload: FfonElement::Str(payload),
+            payload: sicompass_pdk::encode_one(&FfonElement::Str(payload)),
             label,
         });
     }
@@ -828,7 +821,7 @@ impl ProjectManagementProvider {
     fn say_key(&mut self, key: &str, args: &[(&str, String)]) {
         let mut a = localize::Args::new();
         for (k, v) in args {
-            a.set(*k, v.clone());
+            a.set(k, v.clone());
         }
         self.announcement = Some(localize::t_args(key, &a));
     }
@@ -844,14 +837,14 @@ impl ProjectManagementProvider {
         // listener cannot see or reach.
         let total = self.board.visible_len();
         let Some(col) = self.board.columns.get(self.focus.col) else {
-            self.say(localize::t("pm-empty-columns"));
+            self.say(localize::t("projectmanagement-empty-columns"));
             return;
         };
         let title = col.title.clone();
         let cards = col.cards.len();
         if cards == 0 {
             self.say_key(
-                "pm-say-column-empty",
+                "projectmanagement-say-column-empty",
                 &[
                     ("index", (self.focus.col + 1).to_string()),
                     ("total", total.to_string()),
@@ -863,7 +856,7 @@ impl ProjectManagementProvider {
         let i = self.focus.row.min(cards - 1);
         let text = col.cards[i].text.clone();
         self.say_key(
-            "pm-say-card",
+            "projectmanagement-say-card",
             &[
                 ("column", title),
                 ("index", (i + 1).to_string()),
@@ -880,9 +873,9 @@ impl ProjectManagementProvider {
             .map(|e| e.text.clone())
             .unwrap_or_default();
         if text.is_empty() {
-            self.say(localize::t("pm-say-insert-empty"));
+            self.say(localize::t("projectmanagement-say-insert-empty"));
         } else {
-            self.say_key("pm-say-insert", &[("text", text)]);
+            self.say_key("projectmanagement-say-insert", &[("text", text)]);
         }
     }
 
@@ -920,7 +913,7 @@ impl ProjectManagementProvider {
         // Right from the last real column says "no further" rather than stepping
         // onto the archive.
         if next < 0 || next as usize >= self.board.visible_len() {
-            self.say(localize::t("pm-say-edge"));
+            self.say(localize::t("projectmanagement-say-edge"));
             return true;
         }
         self.focus.col = next as usize;
@@ -940,7 +933,7 @@ impl ProjectManagementProvider {
             cur.saturating_sub(1)
         };
         if next == cur {
-            self.say(localize::t("pm-say-edge"));
+            self.say(localize::t("projectmanagement-say-edge"));
             return true;
         }
         self.focus.row = next;
@@ -1020,7 +1013,7 @@ impl ProjectManagementProvider {
             .get(self.focus.col)
             .map(|_| self.focus.col)
         else {
-            self.error = Some(localize::t("pm-error-no-column"));
+            self.error = Some(localize::t("projectmanagement-error-no-column"));
             return;
         };
         let id = self.board.mint_id();
@@ -1057,7 +1050,7 @@ impl ProjectManagementProvider {
                 EditTarget::Card(id) => self.remove_card(id),
             }
             self.clamp_focus();
-            self.say(localize::t("pm-say-board"));
+            self.say(localize::t("projectmanagement-say-board"));
             self.persist();
             return;
         }
@@ -1085,7 +1078,7 @@ impl ProjectManagementProvider {
         }
         self.refresh = true;
         self.persist();
-        self.say(localize::t("pm-say-board"));
+        self.say(localize::t("projectmanagement-say-board"));
     }
 
     /// Delete the focused card.
@@ -1114,7 +1107,7 @@ impl ProjectManagementProvider {
         self.apply(&op, true);
         self.record(op);
         self.clamp_focus();
-        self.say_key("pm-say-deleted", &[("text", text)]);
+        self.say_key("projectmanagement-say-deleted", &[("text", text)]);
     }
 
     fn copy_focused(&mut self, cut: bool) {
@@ -1136,9 +1129,9 @@ impl ProjectManagementProvider {
         }));
         if cut {
             self.delete_focused();
-            self.say_key("pm-say-cut", &[("text", text)]);
+            self.say_key("projectmanagement-say-cut", &[("text", text)]);
         } else {
-            self.say_key("pm-say-copied", &[("text", text)]);
+            self.say_key("projectmanagement-say-copied", &[("text", text)]);
         }
     }
 
@@ -1150,11 +1143,11 @@ impl ProjectManagementProvider {
     /// later edit would land on the wrong one.
     fn paste(&mut self) {
         let Some(Clip::Card(card)) = self.clip.clone() else {
-            self.error = Some(localize::t("pm-error-nothing-to-paste"));
+            self.error = Some(localize::t("projectmanagement-error-nothing-to-paste"));
             return;
         };
         let Some(column) = self.focused_column_id() else {
-            self.error = Some(localize::t("pm-error-no-column"));
+            self.error = Some(localize::t("projectmanagement-error-no-column"));
             return;
         };
         // Onto an empty column's placeholder the card becomes the first one;
@@ -1176,13 +1169,13 @@ impl ProjectManagementProvider {
         self.record(op);
         self.focus.row = index;
         self.clamp_focus();
-        self.say_key("pm-say-pasted", &[("text", card.text)]);
+        self.say_key("projectmanagement-say-pasted", &[("text", card.text)]);
     }
 
     /// Turn pasted system-clipboard text into one card per non-blank line.
     fn paste_text(&mut self, text: &str) {
         let Some(column) = self.focused_column_id() else {
-            self.error = Some(localize::t("pm-error-no-column"));
+            self.error = Some(localize::t("projectmanagement-error-no-column"));
             return;
         };
         let mut index = if self.on_placeholder() {
@@ -1212,7 +1205,7 @@ impl ProjectManagementProvider {
         if !last.is_empty() {
             self.focus.row = index - 1;
             self.clamp_focus();
-            self.say_key("pm-say-pasted", &[("text", last)]);
+            self.say_key("projectmanagement-say-pasted", &[("text", last)]);
         }
     }
 
@@ -1385,9 +1378,10 @@ impl ProjectManagementProvider {
             return id;
         }
         let id = self.board.mint_id();
-        self.board
-            .columns
-            .push(Column::new(id, localize::t("pm-archive-title")));
+        self.board.columns.push(Column::new(
+            id,
+            localize::t("projectmanagement-archive-title"),
+        ));
         self.board.set_archive(id);
         self.board.reseat_counter();
         id
@@ -1408,14 +1402,14 @@ impl ProjectManagementProvider {
     /// it here would be a second history of the same thing.
     fn archive_card(&mut self, elem_key: &str) {
         let Some(id) = self.card_to_archive(elem_key) else {
-            self.say(localize::t("pm-say-nothing-to-archive"));
+            self.say(localize::t("projectmanagement-say-nothing-to-archive"));
             return;
         };
         let Some((ci, ki)) = self.board.locate_card(id) else {
             return;
         };
         if self.board.is_archive(self.board.columns[ci].id) {
-            self.say(localize::t("pm-say-already-archived"));
+            self.say(localize::t("projectmanagement-say-already-archived"));
             return;
         }
         let from_column = self.board.columns[ci].id;
@@ -1445,10 +1439,10 @@ impl ProjectManagementProvider {
             // Dashboard is drained and dropped, never deferred, and the board
             // owns its own cursor anyway.
             if let Some(at) = self.board.column_index(from_column) {
-                self.navigation = Some(NavigationRequest::SelectPath(vec![at]));
+                self.navigation = Some(NavigationRequest::SelectPath(vec![at as u32]));
             }
         }
-        self.say_key("pm-say-archived", &[("text", text)]);
+        self.say_key("projectmanagement-say-archived", &[("text", text)]);
     }
 }
 
@@ -1499,41 +1493,67 @@ fn row_text(raw: &str) -> String {
 // Provider
 // ---------------------------------------------------------------------------
 
-#[async_trait::async_trait]
-impl Provider for ProjectManagementProvider {
-    fn name(&self) -> &str {
-        "projectmanagement"
+impl Plugin for ProjectManagementProvider {
+    fn new() -> Self {
+        ProjectManagementProvider::with_host(Box::new(PluginHost))
     }
 
-    fn display_name(&self) -> String {
-        register_translations();
-        localize::t("projectmanagement-display-name")
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: "projectmanagement".to_owned(),
+            display_name: localize::t("projectmanagement-display-name"),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            supports_structural_edit: true,
+            dashboard_kind: DashboardKind::Interactive,
+            // The board's edits go onto the app's timeline as `ProviderOp`
+            // entries, so Ctrl+Z belongs to the app here rather than being
+            // forwarded as a keystroke this plugin would have to reimplement
+            // against a second, divergent undo stack.
+            dashboard_uses_app_undo: true,
+            ..Default::default()
+        }
     }
 
-    fn version(&self) -> Option<&str> {
-        Some(env!("CARGO_PKG_VERSION"))
+    /// Pick up the backup switch as the user left it, quietly: the "needs a
+    /// subscription" notice is for the moment they switch it on.
+    fn init(&mut self) {
+        let on = sicompass_pdk::host::get_setting(cloud::ENABLE_KEY);
+        self.cloud.restore_enabled(on.as_deref() == Some("true"));
     }
 
     fn fetch(&mut self) -> Vec<FfonElement> {
-        register_translations();
         self.ensure_loaded();
         self.level_children()
     }
 
-    fn supports_structural_edit(&self) -> bool {
-        true
+    /// Every frame: start a backup once the board has been quiet long enough,
+    /// and hand over whatever needs saying or doing.
+    fn poll(&mut self) -> PollResult {
+        self.cloud.tick(&*self.host);
+        let needs_refresh = self.needs_refresh();
+        self.clear_needs_refresh();
+        PollResult {
+            at_root: self.at_root(),
+            needs_refresh,
+            is_busy: self.cloud.is_busy(),
+            error: self.take_error(),
+            announcement: self.take_announcement(),
+            dashboard_request: self.take_dashboard_request(),
+            navigation_request: self.take_navigation_request(),
+            structural_edit_here: true,
+            dashboard_here: true,
+            ..Default::default()
+        }
     }
 
     fn sync_ffon_body_children(&mut self, children: &[FfonElement]) {
-        register_translations();
         self.ensure_loaded();
         self.reconcile(children);
     }
 
     fn commit_edit(&mut self, _old: &str, new: &str) -> bool {
-        register_translations();
         if self.load_failed {
-            self.error = Some(localize::t("pm-error-unreadable"));
+            self.error = Some(localize::t("projectmanagement-error-unreadable"));
             return false;
         }
         // Remembered rather than applied: the app has not yet handed back the
@@ -1543,12 +1563,16 @@ impl Provider for ProjectManagementProvider {
         true
     }
 
-    fn delete_item(&mut self, _name: &str) -> bool {
+    fn delete_item(&mut self, name: &str) -> bool {
         // The veto on the FFON delete path. The trait default is `false`, which
-        // reads as "always refuse", so a capability provider has to answer.
-        register_translations();
+        // reads as "always refuse", so a capability plugin has to answer.
         if self.load_failed {
-            self.error = Some(localize::t("pm-error-unreadable"));
+            self.error = Some(localize::t("projectmanagement-error-unreadable"));
+            return false;
+        }
+        // The backup row is the switch's, in settings, not a column.
+        if cloud::is_row(name) {
+            self.error = Some(localize::t("projectmanagement-error-cloud-row-undeletable"));
             return false;
         }
         true
@@ -1615,26 +1639,11 @@ impl Provider for ProjectManagementProvider {
         }
     }
 
-    fn at_root(&self) -> bool {
-        self.open_column.is_none()
-    }
-
-    fn set_config_path(&mut self, path: PathBuf) {
-        // The trait's own escape hatch for tests, and the only way the app's
-        // integration tests — a separate binary, where this crate is compiled
-        // without `cfg(test)` and reached as a `Box<dyn Provider>` — can keep
-        // away from the real board directory.
-        self.root_override = Some(path);
-        self.loaded = false;
-        self.load_failed = false;
-    }
-
     /// The children of the level the cursor is on, so a commit refreshes just
     /// that list. Without this the app falls back to rebuilding the provider
     /// root, which misroutes a descended path and leaves the level empty.
     fn fetch_subtree_children(&mut self) -> Option<Vec<FfonElement>> {
         self.open_column?;
-        register_translations();
         self.ensure_loaded();
         Some(self.level_children())
     }
@@ -1650,73 +1659,37 @@ impl Provider for ProjectManagementProvider {
     /// at the root and the tab reopened with the column closed.
     fn fetch_subtree_parent_key(&mut self) -> Option<String> {
         let col = self.open_column?;
-        register_translations();
         self.ensure_loaded();
         self.board
             .column(col)
             .map(|c| Self::row_label(c.id, &c.title))
     }
 
-    /// Cloud backup settings. The app broadcasts every setting to every
-    /// provider, so this only claims the three that are ours.
+    /// The backup switch. The host passes on only this plugin's own settings.
     fn on_setting_change(&mut self, key: &str, value: &str) {
-        self.cloud.on_setting_change(key, value);
+        self.cloud.on_setting_change(key, value, &*self.host);
     }
 
-    /// The controls inside the cloud tier tree, which the app grafts into
-    /// *this* provider's tree when the user follows the cloud row. The board
-    /// itself has no buttons or radios of its own.
-    fn on_button_press(&mut self, function_name: &str) {
-        self.cloud.on_button_press(function_name);
-    }
-
-    fn on_radio_change(&mut self, group: &str, value: &str) {
-        self.cloud.on_radio_change(group, value);
-    }
-
-    fn needs_refresh(&self) -> bool {
-        // The backup worker runs on its own thread, so a finished upload (or a
-        // failed one) has to ask for the row to be redrawn.
-        self.refresh || self.cloud.needs_refresh()
-    }
-
-    fn clear_needs_refresh(&mut self) {
-        self.refresh = false;
-        self.cloud.clear_needs_refresh();
-    }
-
-    fn take_error(&mut self) -> Option<String> {
-        // The board's own error leads: a board that could not be saved matters
-        // more than a backup that could not be uploaded.
-        self.error.take().or_else(|| self.cloud.take_error())
-    }
-
-    fn take_announcement(&mut self) -> Option<String> {
-        self.announcement
-            .take()
-            .or_else(|| self.cloud.take_announcement())
-    }
-
-    fn take_timeline_entries(&mut self) -> Vec<TimelineEntry> {
+    fn take_timeline_entries(&mut self) -> Vec<ProviderOp> {
         std::mem::take(&mut self.timeline)
     }
 
-    async fn undo(&mut self, entry: &TimelineEntry, _error: &mut String) {
-        register_translations();
+    fn undo(&mut self, entry: &ProviderOp) -> Result<(), String> {
         if let Some((op, label)) = decode_op(entry) {
             self.apply(&op, false);
             self.clamp_focus();
-            self.say_key("pm-say-undone", &[("what", label)]);
+            self.say_key("projectmanagement-say-undone", &[("what", label)]);
         }
+        Ok(())
     }
 
-    async fn redo(&mut self, entry: &TimelineEntry, _error: &mut String) {
-        register_translations();
+    fn redo(&mut self, entry: &ProviderOp) -> Result<(), String> {
         if let Some((op, label)) = decode_op(entry) {
             self.apply(&op, true);
             self.clamp_focus();
-            self.say_key("pm-say-redone", &[("what", label)]);
+            self.say_key("projectmanagement-say-redone", &[("what", label)]);
         }
+        Ok(())
     }
 
     fn commands(&self) -> Vec<String> {
@@ -1746,14 +1719,13 @@ impl Provider for ProjectManagementProvider {
     }
 
     fn command_label(&self, cmd: &str) -> String {
-        register_translations();
         match cmd {
-            CMD_MOVE_UP => localize::t("pm-cmd-move-up"),
-            CMD_MOVE_DOWN => localize::t("pm-cmd-move-down"),
-            CMD_MOVE_LEFT => localize::t("pm-cmd-move-left"),
-            CMD_MOVE_RIGHT => localize::t("pm-cmd-move-right"),
-            CMD_ARCHIVE => localize::t("pm-cmd-archive-card"),
-            CMD_RESTORE_BACKUP => localize::t("payments-command-restore"),
+            CMD_MOVE_UP => localize::t("projectmanagement-cmd-move-up"),
+            CMD_MOVE_DOWN => localize::t("projectmanagement-cmd-move-down"),
+            CMD_MOVE_LEFT => localize::t("projectmanagement-cmd-move-left"),
+            CMD_MOVE_RIGHT => localize::t("projectmanagement-cmd-move-right"),
+            CMD_ARCHIVE => localize::t("projectmanagement-cmd-archive-card"),
+            CMD_RESTORE_BACKUP => localize::t("projectmanagement-cmd-restore-backup"),
             other => other.to_owned(),
         }
     }
@@ -1763,9 +1735,7 @@ impl Provider for ProjectManagementProvider {
         cmd: &str,
         elem_key: &str,
         _elem_type: i32,
-        _error: &mut String,
-    ) -> Option<FfonElement> {
-        register_translations();
+    ) -> Result<Option<FfonElement>, String> {
         self.ensure_loaded();
         // Always `None`, never an error. Both of the app's other return paths
         // reset the coordinate to `rest_coordinate` -- General for this provider
@@ -1774,11 +1744,11 @@ impl Provider for ProjectManagementProvider {
         // instead, which returns to whichever mode the palette was opened from.
         if cmd == CMD_ARCHIVE {
             self.archive_card(elem_key);
-            return None;
+            return Ok(None);
         }
         if cmd == CMD_RESTORE_BACKUP {
             self.restore_cloud_backup();
-            return None;
+            return Ok(None);
         }
         let ok = match cmd {
             CMD_MOVE_UP => self.move_row_in_list(false, elem_key),
@@ -1787,37 +1757,55 @@ impl Provider for ProjectManagementProvider {
             CMD_MOVE_RIGHT => self.move_card_sideways(true, elem_key),
             _ => false,
         };
-        if ok {
-            Some(FfonElement::new_str(""))
-        } else {
-            None
+        Ok(ok.then(|| FfonElement::new_str("")))
+    }
+
+    /// In a fresh worker instance: the upload or the restore. Everything it
+    /// needs is on disk or from the host, so `input` carries only the hash of
+    /// the last upload.
+    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+        let root = self.root().ok_or("the board has no folder")?;
+        let token = self.host.token();
+        let service = &cloud::SERVICE;
+        match name {
+            cloud::TASK_BACKUP => sicompass_payments::cloud::run_backup(
+                service,
+                &root,
+                input,
+                token,
+                &cloud::net_send,
+            ),
+            cloud::TASK_RESTORE => {
+                sicompass_payments::cloud::run_restore(service, &root, token, &cloud::net_send)
+            }
+            other => Err(format!("no task named `{other}`")),
+        }
+    }
+
+    fn on_task_event(&mut self, id: u64, event: TaskEvent) {
+        let TaskEvent::Done(result) = event else {
+            return;
+        };
+        if self.cloud.on_task_done(id, result, &*self.host) == Finished::Restored {
+            // The board in memory is stale: re-read what the task wrote.
+            self.loaded = false;
+            self.load_failed = false;
+            self.ensure_loaded();
+            self.refresh = true;
         }
     }
 
     // ---- The board ------------------------------------------------------
 
-    fn dashboard_kind(&self) -> DashboardKind {
-        DashboardKind::Interactive
+    fn set_dashboard_palette(&mut self, palette: sicompass_pdk::Palette) {
+        self.palette = to_sdk_palette(palette);
     }
 
-    fn set_dashboard_palette(&mut self, palette: sicompass_sdk::DashboardPalette) {
-        self.palette = palette;
-    }
-
-    fn dashboard_uses_app_undo(&self) -> bool {
-        // The board's edits go onto the app's timeline as `ProviderOp` entries,
-        // so Ctrl+Z belongs to the app here rather than being forwarded as a
-        // keystroke this provider would have to reimplement against a second,
-        // divergent undo stack.
-        true
-    }
-
-    fn set_dashboard_entry(&mut self, path: &[usize]) {
-        self.entry_path = path.to_vec();
+    fn set_dashboard_entry(&mut self, path: &[u32]) {
+        self.entry_path = path.iter().map(|&i| i as usize).collect();
     }
 
     fn enter_dashboard(&mut self) {
-        register_translations();
         self.ensure_loaded();
         self.mode = BoardMode::Board;
         self.in_dashboard = true;
@@ -1866,42 +1854,17 @@ impl Provider for ProjectManagementProvider {
         // row itself is as close as the list can get.
         if !self.on_placeholder() && self.board.columns.get(self.focus.col).is_some() {
             self.navigation = Some(NavigationRequest::SelectPath(vec![
-                self.focus.col,
-                self.focus.row,
+                self.focus.col as u32,
+                self.focus.row as u32,
             ]));
         }
     }
 
-    fn take_dashboard_request(&mut self) -> Option<DashboardRequest> {
-        self.dashboard_request.take()
+    fn dashboard_render(&mut self, cols: u16, rows: u16) -> sicompass_pdk::Frame {
+        to_frame(self.render_frame(cols, rows))
     }
 
-    fn take_navigation_request(&mut self) -> Option<NavigationRequest> {
-        self.navigation.take()
-    }
-
-    fn dashboard_render(&mut self, cols: u16, rows: u16) -> DashboardFrame {
-        register_translations();
-        self.ensure_loaded();
-        self.clamp_focus();
-        self.board_cols = cols;
-        let editing = self.edit.as_ref().map(|e| (e.text.as_str(), e.caret));
-        // Resolved here rather than inside the renderer: `render` is pure drawing
-        // and has no business reaching the localizer.
-        let empty_label = localize::t("pm-board-empty-slot");
-        let no_columns_label = localize::t("pm-board-no-columns");
-        let view = View {
-            focus: self.focus,
-            editing,
-            empty_label: &empty_label,
-            no_columns_label: &no_columns_label,
-            palette: self.palette,
-        };
-        render::render(&self.board, &view, cols, rows)
-    }
-
-    fn dashboard_key(&mut self, key: DashboardKey) -> bool {
-        register_translations();
+    fn dashboard_key(&mut self, key: Key) -> bool {
         self.ensure_loaded();
         match self.mode {
             BoardMode::Board => self.board_key(key),
@@ -1926,7 +1889,6 @@ impl Provider for ProjectManagementProvider {
     }
 
     fn dashboard_paste(&mut self, text: &str) {
-        register_translations();
         self.ensure_loaded();
         match self.mode {
             // Inside a card, a paste is text: newlines would make one card into
@@ -1947,10 +1909,10 @@ impl ProjectManagementProvider {
     /// focus is in. On a card those two coincide and Ctrl+A is an alias for `a`;
     /// on a column head they differ, which is what makes columns creatable from
     /// the board at all.
-    fn board_key(&mut self, key: DashboardKey) -> bool {
-        use DashboardKeysym as K;
+    fn board_key(&mut self, key: Key) -> bool {
+        use Keysym as K;
         let ctrl = key.ctrl;
-        match key.keysym {
+        match key.sym {
             K::Left => self.move_column(-1),
             K::Right => self.move_column(1),
             K::Up => self.move_row(false),
@@ -1963,21 +1925,21 @@ impl ProjectManagementProvider {
                 self.delete_focused();
                 true
             }
-            K::Char('h') if !ctrl => self.move_column(-1),
-            K::Char('l') if !ctrl => self.move_column(1),
-            K::Char('k') if !ctrl => self.move_row(false),
-            K::Char('j') if !ctrl => self.move_row(true),
+            K::Ch('h') if !ctrl => self.move_column(-1),
+            K::Ch('l') if !ctrl => self.move_column(1),
+            K::Ch('k') if !ctrl => self.move_row(false),
+            K::Ch('j') if !ctrl => self.move_row(true),
             // `i` and `a` edit the focused card, caret at the start or the end.
             // The same meaning they carry everywhere else in the app. On an empty
             // column's placeholder there is nothing to edit, so they start the
             // first card instead — the list behaves the same way, because an
             // empty level there *is* an `<input>` slot.
-            K::Char('i') if !ctrl => {
+            K::Ch('i') if !ctrl => {
                 self.suppress_text = Some("i".to_owned());
                 self.begin_rename(false);
                 true
             }
-            K::Char('a') if !ctrl => {
+            K::Ch('a') if !ctrl => {
                 self.suppress_text = Some("a".to_owned());
                 self.begin_rename(true);
                 true
@@ -1987,37 +1949,37 @@ impl ProjectManagementProvider {
             // own insert-before and append-after, and on a board of cards those
             // mean the same two things — kept as aliases so the keys that work
             // in the list keep working here.
-            K::Char('o') if !ctrl && !key.shift => {
+            K::Ch('o') if !ctrl && !key.shift => {
                 self.suppress_text = Some("o".to_owned());
                 self.begin_new_card(self.below());
                 true
             }
-            K::Char('o') if !ctrl && key.shift => {
+            K::Ch('o') if !ctrl && key.shift => {
                 self.suppress_text = Some("O".to_owned());
                 self.begin_new_card(self.above());
                 true
             }
-            K::Char('i') if ctrl => {
+            K::Ch('i') if ctrl => {
                 self.begin_new_card(self.above());
                 true
             }
-            K::Char('a') if ctrl => {
+            K::Ch('a') if ctrl => {
                 self.begin_new_card(self.below());
                 true
             }
-            K::Char('d') if ctrl => {
+            K::Ch('d') if ctrl => {
                 self.delete_focused();
                 true
             }
-            K::Char('x') if ctrl => {
+            K::Ch('x') if ctrl => {
                 self.copy_focused(true);
                 true
             }
-            K::Char('c') if ctrl => {
+            K::Ch('c') if ctrl => {
                 self.copy_focused(false);
                 true
             }
-            K::Char('v') if ctrl && !key.shift => {
+            K::Ch('v') if ctrl && !key.shift => {
                 self.paste();
                 true
             }
@@ -2026,9 +1988,9 @@ impl ProjectManagementProvider {
     }
 
     /// Keys in insert mode. Printable characters arrive through `dashboard_text`.
-    fn insert_key(&mut self, key: DashboardKey) -> bool {
-        use DashboardKeysym as K;
-        match key.keysym {
+    fn insert_key(&mut self, key: Key) -> bool {
+        use Keysym as K;
+        match key.sym {
             // Escape keeps what was typed rather than discarding it, matching
             // the app's own Insert to General transition. Anyone who wanted the
             // old text back is one Ctrl+Z away, and that is undoable in turn.
@@ -2088,85 +2050,172 @@ impl ProjectManagementProvider {
 
 /// Read a board op back out of a timeline entry, with its localized label.
 ///
-/// Anything that is not one of ours is ignored rather than guessed at: the tab's
-/// timeline also carries the app's own `Structural` entries for the list surface.
-fn decode_op(entry: &TimelineEntry) -> Option<(BoardOp, String)> {
-    let TimelineEntry::ProviderOp { payload, label, .. } = entry else {
-        return None;
-    };
+/// Anything that is not one of ours is ignored rather than guessed at.
+fn decode_op(entry: &ProviderOp) -> Option<(BoardOp, String)> {
+    let payload = sicompass_pdk::decode_one(&entry.payload)?;
     let json = payload.as_str()?;
     let op: BoardOp = serde_json::from_str(json).ok()?;
-    Some((op, label.clone()))
+    Some((op, entry.label.clone()))
 }
 
-pub fn register() {
-    register_translations();
-    register_provider_factory("projectmanagement", || {
-        Box::new(ProjectManagementProvider::new())
-    });
-    register_builtin_manifest(
-        BuiltinManifest::new("projectmanagement", "project management")
-            .enable_by_default()
-            .with_settings(vec![SettingDecl::checkbox(
-                // The section is the display name, which is how the app finds
-                // and removes a provider's settings block.
-                "project management",
-                "pm-checkbox-cloud-backup",
-                CLOUD_ENABLE_KEY,
-                // Off by default: sending a board anywhere is something the
-                // user asks for.
-                false,
-            )]),
-    );
+// ---------------------------------------------------------------------------
+// The renderer's types and the plugin interface's
+//
+// `render` draws in the SDK's dashboard types, which is what its tests read.
+// The plugin interface has its own, generated from the WIT, so the palette is
+// converted on the way in and the frame on the way out.
+// ---------------------------------------------------------------------------
+
+fn to_sdk_palette(p: sicompass_pdk::Palette) -> sicompass_sdk::DashboardPalette {
+    sicompass_sdk::DashboardPalette {
+        background: p.background,
+        text: p.text,
+        header_sep: p.header_sep,
+        selected: p.selected,
+        ext_search: p.ext_search,
+        scroll_search: p.scroll_search,
+        error: p.error,
+    }
 }
+
+fn to_frame(f: sicompass_sdk::DashboardFrame) -> sicompass_pdk::Frame {
+    use sicompass_pdk::{Cell, CellAttrs, CursorStyle, Frame, Selection};
+    Frame {
+        cols: f.cols,
+        rows: f.rows,
+        cells: f
+            .cells
+            .into_iter()
+            .map(|c| Cell {
+                ch: c.ch,
+                fg: c.fg,
+                bg: c.bg,
+                attrs: CellAttrs {
+                    bold: c.attrs.bold,
+                    underline: c.attrs.underline,
+                    reverse: c.attrs.reverse,
+                },
+            })
+            .collect(),
+        cursor: f.cursor,
+        selection: f.selection.map(|s| Selection {
+            col: s.col,
+            row: s.row,
+            cols: s.cols,
+            rows: s.rows,
+        }),
+        half_gap_rows: f.half_gap_rows,
+        cursor_style: match f.cursor_style {
+            sicompass_sdk::DashboardCursor::Block => CursorStyle::Block,
+            sicompass_sdk::DashboardCursor::Bar => CursorStyle::Bar,
+        },
+    }
+}
+
+export_plugin!(ProjectManagementProvider);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sicompass_payments::cert::LicenseStatus;
+    use sicompass_payments::row::Standing;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
     use tempfile::TempDir;
+
+    /// The host as the tests set it: a clock, a standing, a token, and a log
+    /// of the tasks spawned. Cloned into the provider, so a test keeps a handle.
+    #[derive(Clone)]
+    struct FakeHost(Rc<FakeState>);
+
+    struct FakeState {
+        now: Cell<u64>,
+        standing: Cell<Standing>,
+        spawned: RefCell<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl FakeHost {
+        fn new(standing: Standing) -> Self {
+            FakeHost(Rc::new(FakeState {
+                now: Cell::new(0),
+                standing: Cell::new(standing),
+                spawned: RefCell::new(Vec::new()),
+            }))
+        }
+
+        fn advance(&self, ms: u64) {
+            self.0.now.set(self.0.now.get() + ms);
+        }
+
+        fn spawned(&self) -> Vec<(String, Vec<u8>)> {
+            self.0.spawned.borrow().clone()
+        }
+    }
+
+    impl cloud::Host for FakeHost {
+        fn now_millis(&self) -> u64 {
+            self.0.now.get()
+        }
+
+        fn standing(&self) -> Standing {
+            self.0.standing.get()
+        }
+
+        /// Task ids are 1, 2, 3, in spawn order.
+        fn spawn(&self, task: &str, input: &[u8]) -> Result<u64, String> {
+            let mut log = self.0.spawned.borrow_mut();
+            log.push((task.to_owned(), input.to_vec()));
+            Ok(log.len() as u64)
+        }
+
+        fn translate(&self, id: &str, args: &[(&str, String)]) -> String {
+            cloud::translate(id, args)
+        }
+    }
+
+    impl CloudHost for FakeHost {
+        fn token(&self) -> Option<String> {
+            Some("tok-42".to_owned())
+        }
+    }
 
     /// A provider backed by a real, disposable directory.
     ///
-    /// The `cfg!(test)` default already stops a forgotten override reaching the
-    /// user's board, but a test that asserts anything about the store needs
-    /// somewhere real to look.
+    /// Natively `root()` is nothing without one, so a forgotten one cannot
+    /// reach a real board, but a test that asserts anything about the store
+    /// needs somewhere real to look.
     fn provider(dir: &TempDir) -> ProjectManagementProvider {
-        register_translations();
-        // This binary compiles `sicompass-payments` without `cfg(test)`, so its
-        // own `cfg!(test)` default is off here and the guard has to be set
-        // explicitly. Without it these tests would read the developer's real
-        // settings and could write a token into their live config.
-        sicompass_payments::config::_set_test_no_persist(true);
-        let mut p = ProjectManagementProvider::new();
-        p.root_override = Some(dir.path().join("board"));
+        provider_on(dir, &FakeHost::new(Standing::Missing))
+    }
+
+    fn provider_on(dir: &TempDir, host: &FakeHost) -> ProjectManagementProvider {
+        let mut p = ProjectManagementProvider::with_host(Box::new(host.clone()));
+        p.set_root(dir.path().join("board"));
         p
     }
 
-    /// A seeded board with cloud backup switched on and a known subscription.
-    ///
-    /// The status is forced rather than read off disk: `cloud_status()` looks
-    /// in the real user config directory, so without this a developer who
-    /// actually holds a subscription would see different rows than CI does.
-    fn seeded_with_cloud(status: LicenseStatus) -> ProjectManagementProvider {
-        sicompass_payments::config::_set_test_no_persist(true);
-        sicompass_payments::cloud::_set_test_status(Some(status));
-        let mut p = seeded();
-        p.on_setting_change("storeUrl", "http://127.0.0.1:1");
-        p.on_setting_change(CLOUD_ENABLE_KEY, "true");
-        p
+    /// A seeded board with cloud backup switched on and a known standing.
+    fn seeded_with_cloud(standing: Standing) -> ProjectManagementProvider {
+        seeded_on(&FakeHost::new(standing), true)
     }
 
-    fn active_licence() -> LicenseStatus {
-        LicenseStatus::Active {
-            licensee: "Acme Corp".to_owned(),
+    fn active_licence() -> Standing {
+        Standing::Active {
             renews_in_days: 342,
         }
     }
 
+    /// The seeded board on `host`, with the backup switch as given.
+    fn seeded_on(host: &FakeHost, cloud_on: bool) -> ProjectManagementProvider {
+        let mut p = seeded();
+        p.host = Box::new(host.clone());
+        if cloud_on {
+            p.on_setting_change(cloud::ENABLE_KEY, "true");
+        }
+        p
+    }
+
     /// Two columns and three cards, and no disk at all.
     fn seeded() -> ProjectManagementProvider {
-        register_translations();
         let mut p = ProjectManagementProvider::new();
         p.loaded = true;
         let mut todo = Column::new(1, "To do");
@@ -2178,6 +2227,15 @@ mod tests {
         p.board.columns.push(doing);
         p.board.reseat_counter();
         p
+    }
+
+    /// The path the plugin asked the list cursor to land on, if any. The
+    /// interface's `NavigationRequest` has no `PartialEq`, so tests compare this.
+    fn nav(p: &mut ProjectManagementProvider) -> Option<Vec<u32>> {
+        p.take_navigation_request().map(|r| match r {
+            NavigationRequest::SelectPath(at) => at,
+            NavigationRequest::EnterChildren => panic!("the board never asks to enter children"),
+        })
     }
 
     /// What a screen reader would read: every row's display text, tags gone.
@@ -2193,27 +2251,27 @@ mod tests {
             .collect()
     }
 
-    fn key(k: DashboardKeysym) -> DashboardKey {
-        DashboardKey {
-            keysym: k,
+    fn key(k: Keysym) -> Key {
+        Key {
+            sym: k,
             ctrl: false,
             shift: false,
             alt: false,
         }
     }
 
-    fn shift(k: DashboardKeysym) -> DashboardKey {
-        DashboardKey {
-            keysym: k,
+    fn shift(k: Keysym) -> Key {
+        Key {
+            sym: k,
             ctrl: false,
             shift: true,
             alt: false,
         }
     }
 
-    fn ctrl(k: DashboardKeysym) -> DashboardKey {
-        DashboardKey {
-            keysym: k,
+    fn ctrl(k: Keysym) -> Key {
+        Key {
+            sym: k,
             ctrl: true,
             shift: false,
             alt: false,
@@ -2231,9 +2289,9 @@ mod tests {
 
     /// Open the board and type a card at the cursor.
     fn add_card(p: &mut ProjectManagementProvider, text: &str) {
-        p.dashboard_key(key(DashboardKeysym::Char('o')));
+        p.dashboard_key(key(Keysym::Ch('o')));
         p.dashboard_text(text);
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Enter));
     }
 
     // ---- The list surface ----------------------------------------------
@@ -2271,7 +2329,6 @@ mod tests {
     fn an_empty_level_renders_a_placeholder_rather_than_nothing() {
         let mut p = ProjectManagementProvider::new();
         p.loaded = true;
-        register_translations();
         assert_eq!(p.fetch().len(), 1);
         assert!(labels(&p.fetch())[0].contains("no columns"));
     }
@@ -2280,7 +2337,6 @@ mod tests {
     fn the_placeholder_never_becomes_a_real_column() {
         let mut p = ProjectManagementProvider::new();
         p.loaded = true;
-        register_translations();
         let placeholder = p.fetch();
         p.sync_ffon_body_children(&placeholder);
         assert!(p.board.columns.is_empty());
@@ -2551,7 +2607,7 @@ mod tests {
         // There is no head to land on any more, so the top card is the top.
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Up));
+        p.dashboard_key(key(Keysym::Up));
         assert_eq!(p.focus, Focus { col: 0, row: 0 });
     }
 
@@ -2559,15 +2615,15 @@ mod tests {
     fn arrows_move_between_columns_and_within_one() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Down));
+        p.dashboard_key(key(Keysym::Down));
         assert_eq!(p.focus, Focus { col: 0, row: 1 });
-        p.dashboard_key(key(DashboardKeysym::Down));
+        p.dashboard_key(key(Keysym::Down));
         assert_eq!(
             p.focus,
             Focus { col: 0, row: 1 },
             "clamped at the last card"
         );
-        p.dashboard_key(key(DashboardKeysym::Right));
+        p.dashboard_key(key(Keysym::Right));
         assert_eq!(p.focus, Focus { col: 1, row: 0 }, "Doing holds one card");
     }
 
@@ -2575,13 +2631,13 @@ mod tests {
     fn hjkl_move_the_same_way_the_arrows_do() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Char('j')));
+        p.dashboard_key(key(Keysym::Ch('j')));
         assert_eq!(p.focus.row, 1);
-        p.dashboard_key(key(DashboardKeysym::Char('l')));
+        p.dashboard_key(key(Keysym::Ch('l')));
         assert_eq!(p.focus.col, 1);
-        p.dashboard_key(key(DashboardKeysym::Char('h')));
+        p.dashboard_key(key(Keysym::Ch('h')));
         assert_eq!(p.focus.col, 0);
-        p.dashboard_key(key(DashboardKeysym::Char('k')));
+        p.dashboard_key(key(Keysym::Ch('k')));
         assert_eq!(p.focus.row, 0);
     }
 
@@ -2590,8 +2646,8 @@ mod tests {
         let mut p = seeded();
         p.board.columns.push(Column::new(9, "Done"));
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Right));
-        p.dashboard_key(key(DashboardKeysym::Right));
+        p.dashboard_key(key(Keysym::Right));
+        p.dashboard_key(key(Keysym::Right));
         assert_eq!(p.focus, Focus { col: 2, row: 0 });
         assert!(p.on_placeholder());
     }
@@ -2624,10 +2680,7 @@ mod tests {
         p.enter_dashboard();
         assert_eq!(p.focus, Focus { col: 0, row: 1 });
         p.leave_dashboard();
-        assert_eq!(
-            p.take_navigation_request(),
-            Some(NavigationRequest::SelectPath(vec![0, 1]))
-        );
+        assert_eq!(nav(&mut p), Some(vec![0, 1]));
     }
 
     #[test]
@@ -2657,7 +2710,7 @@ mod tests {
         let mut p = seeded();
         p.enter_dashboard();
         let _ = p.take_announcement();
-        p.dashboard_key(key(DashboardKeysym::Down));
+        p.dashboard_key(key(Keysym::Down));
         let said = p.take_announcement().expect("a move must be announced");
         assert!(said.contains("write docs"), "got {said:?}");
         assert!(said.contains("To do"), "got {said:?}");
@@ -2681,7 +2734,7 @@ mod tests {
         a.set("title", "Done");
         assert_eq!(
             said,
-            localize::t_args("pm-say-column-empty", &a),
+            localize::t_args("projectmanagement-say-column-empty", &a),
             "got {said:?}"
         );
     }
@@ -2693,7 +2746,7 @@ mod tests {
         for (k, want) in [('i', 0usize), ('a', 9usize)] {
             let mut p = seeded();
             p.enter_dashboard();
-            p.dashboard_key(key(DashboardKeysym::Char(k)));
+            p.dashboard_key(key(Keysym::Ch(k)));
             let edit = p.edit.as_ref().expect("insert mode should be open");
             assert_eq!(edit.text, "fix login");
             assert_eq!(edit.caret, want, "`{k}` caret");
@@ -2705,9 +2758,9 @@ mod tests {
     fn ctrl_enter_adds_a_line_that_up_and_down_cross_and_enter_commits() {
         let mut p = seeded();
         p.enter_dashboard();
-        let _ = p.dashboard_render(80, 30);
-        p.dashboard_key(key(DashboardKeysym::Char('a')));
-        p.dashboard_key(ctrl(DashboardKeysym::Enter));
+        let _ = p.render_frame(80, 30);
+        p.dashboard_key(key(Keysym::Ch('a')));
+        p.dashboard_key(ctrl(Keysym::Enter));
         p.dashboard_text("ship");
         let len = "fix login\nship".len();
         {
@@ -2717,16 +2770,16 @@ mod tests {
         }
         // "ship" starts flush, like a new line in any other field in the app,
         // so its end is column 4 and Up lands on column 4 of the line above.
-        p.dashboard_key(key(DashboardKeysym::Up));
+        p.dashboard_key(key(Keysym::Up));
         assert_eq!(p.edit.as_ref().unwrap().caret, "fix ".len());
-        p.dashboard_key(key(DashboardKeysym::Down));
+        p.dashboard_key(key(Keysym::Down));
         assert_eq!(p.edit.as_ref().unwrap().caret, len);
-        p.dashboard_key(key(DashboardKeysym::Down));
+        p.dashboard_key(key(Keysym::Down));
         assert_eq!(p.edit.as_ref().unwrap().caret, len, "Down on the last line");
-        p.dashboard_key(key(DashboardKeysym::Up));
-        p.dashboard_key(key(DashboardKeysym::Up));
+        p.dashboard_key(key(Keysym::Up));
+        p.dashboard_key(key(Keysym::Up));
         assert_eq!(p.edit.as_ref().unwrap().caret, 0, "Up on the first line");
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Enter));
         assert!(p.edit.is_none(), "Enter commits");
         assert_eq!(p.board.columns[0].cards[0].text, "fix login\nship");
     }
@@ -2735,21 +2788,21 @@ mod tests {
     fn up_and_down_walk_the_wrapped_lines_of_a_long_card() {
         let mut p = seeded();
         p.enter_dashboard();
-        let _ = p.dashboard_render(80, 30);
-        p.dashboard_key(key(DashboardKeysym::Char('a')));
+        let _ = p.render_frame(80, 30);
+        p.dashboard_key(key(Keysym::Ch('a')));
         let lay = render::layout(p.board.columns.len(), p.focus.col, 80);
         let width = lay.width_of(p.focus.col);
         p.dashboard_text(&" word".repeat(width as usize));
         let text = p.edit.as_ref().unwrap().text.clone();
         let lines = render::card_lines(&text, width);
         assert!(lines.len() >= 3, "the card must wrap: {lines:?}");
-        p.dashboard_key(key(DashboardKeysym::Up));
+        p.dashboard_key(key(Keysym::Up));
         let caret = p.edit.as_ref().unwrap().caret;
         assert_eq!(input::line_index(&lines, caret), lines.len() - 2);
-        p.dashboard_key(key(DashboardKeysym::Down));
+        p.dashboard_key(key(Keysym::Down));
         let caret = p.edit.as_ref().unwrap().caret;
         assert_eq!(input::line_index(&lines, caret), lines.len() - 1);
-        p.dashboard_key(key(DashboardKeysym::Down));
+        p.dashboard_key(key(Keysym::Down));
         assert_eq!(p.edit.as_ref().unwrap().caret, text.len());
     }
 
@@ -2759,8 +2812,8 @@ mod tests {
             let mut p = seeded();
             p.enter_dashboard();
             let before = p.board.card_count();
-            p.dashboard_key(key(DashboardKeysym::Char(k)));
-            p.dashboard_key(key(DashboardKeysym::Escape));
+            p.dashboard_key(key(Keysym::Ch(k)));
+            p.dashboard_key(key(Keysym::Escape));
             assert_eq!(p.board.card_count(), before, "`{k}` must not create");
         }
     }
@@ -2771,7 +2824,7 @@ mod tests {
         // mode arrives again as text. Without the guard the card reads "ox".
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Char('o')));
+        p.dashboard_key(key(Keysym::Ch('o')));
         p.dashboard_text("o");
         p.dashboard_text("x");
         assert_eq!(p.edit.as_ref().unwrap().text, "x");
@@ -2781,7 +2834,7 @@ mod tests {
     fn the_guard_never_eats_a_real_letter_later_on() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Char('o')));
+        p.dashboard_key(key(Keysym::Ch('o')));
         // The duplicate never arrives (a different keyboard path, say), and the
         // user types the same letter on purpose two keystrokes later.
         p.dashboard_text("b");
@@ -2795,9 +2848,9 @@ mod tests {
         p.enter_dashboard();
         add_card(&mut p, "below");
         p.focus = Focus { col: 0, row: 0 };
-        p.dashboard_key(shift(DashboardKeysym::Char('o')));
+        p.dashboard_key(shift(Keysym::Ch('o')));
         p.dashboard_text("above");
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Enter));
         assert_eq!(
             cards(&p, 0),
             vec!["above", "fix login", "below", "write docs"]
@@ -2808,13 +2861,13 @@ mod tests {
     fn ctrl_i_and_ctrl_a_insert_before_and_after_like_they_do_in_the_list() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(ctrl(DashboardKeysym::Char('a')));
+        p.dashboard_key(ctrl(Keysym::Ch('a')));
         p.dashboard_text("after");
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Enter));
         p.focus = Focus { col: 0, row: 0 };
-        p.dashboard_key(ctrl(DashboardKeysym::Char('i')));
+        p.dashboard_key(ctrl(Keysym::Ch('i')));
         p.dashboard_text("before");
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Enter));
         assert_eq!(
             cards(&p, 0),
             vec!["before", "fix login", "after", "write docs"]
@@ -2829,9 +2882,9 @@ mod tests {
         p.board.columns.push(Column::new(9, "Done"));
         p.enter_dashboard();
         p.focus = Focus { col: 2, row: 0 };
-        p.dashboard_key(ctrl(DashboardKeysym::Char('a')));
+        p.dashboard_key(ctrl(Keysym::Ch('a')));
         p.dashboard_text("shipped");
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Enter));
         assert_eq!(cards(&p, 2), vec!["shipped"]);
     }
 
@@ -2841,12 +2894,12 @@ mod tests {
         // being dead keys — the list behaves the same way, because an empty level
         // there *is* an `<input>` slot.
         for k in [
-            key(DashboardKeysym::Char('i')),
-            key(DashboardKeysym::Char('a')),
-            key(DashboardKeysym::Char('o')),
-            shift(DashboardKeysym::Char('o')),
-            ctrl(DashboardKeysym::Char('i')),
-            ctrl(DashboardKeysym::Char('a')),
+            key(Keysym::Ch('i')),
+            key(Keysym::Ch('a')),
+            key(Keysym::Ch('o')),
+            shift(Keysym::Ch('o')),
+            ctrl(Keysym::Ch('i')),
+            ctrl(Keysym::Ch('a')),
         ] {
             let mut p = seeded();
             p.board.columns.push(Column::new(9, "Done"));
@@ -2854,7 +2907,7 @@ mod tests {
             p.focus = Focus { col: 2, row: 0 };
             p.dashboard_key(k);
             p.dashboard_text("first");
-            p.dashboard_key(key(DashboardKeysym::Enter));
+            p.dashboard_key(key(Keysym::Enter));
             assert_eq!(cards(&p, 2), vec!["first"], "for {k:?}");
         }
     }
@@ -2865,7 +2918,7 @@ mod tests {
         p.board.columns.push(Column::new(9, "Done"));
         p.enter_dashboard();
         p.focus = Focus { col: 2, row: 0 };
-        p.dashboard_key(ctrl(DashboardKeysym::Char('d')));
+        p.dashboard_key(ctrl(Keysym::Ch('d')));
         assert_eq!(p.board.columns.len(), 3, "the column must survive");
         assert!(p.take_timeline_entries().is_empty());
     }
@@ -2875,9 +2928,9 @@ mod tests {
         let mut p = seeded();
         p.board.columns.push(Column::new(9, "Done"));
         p.enter_dashboard();
-        p.dashboard_key(ctrl(DashboardKeysym::Char('c')));
+        p.dashboard_key(ctrl(Keysym::Ch('c')));
         p.focus = Focus { col: 2, row: 0 };
-        p.dashboard_key(ctrl(DashboardKeysym::Char('v')));
+        p.dashboard_key(ctrl(Keysym::Ch('v')));
         assert_eq!(cards(&p, 2), vec!["fix login"]);
     }
 
@@ -2897,21 +2950,21 @@ mod tests {
             .map(|c| (c.id, c.title.clone()))
             .collect();
         for k in [
-            key(DashboardKeysym::Char('i')),
-            key(DashboardKeysym::Char('a')),
-            key(DashboardKeysym::Char('o')),
-            shift(DashboardKeysym::Char('o')),
-            ctrl(DashboardKeysym::Char('i')),
-            ctrl(DashboardKeysym::Char('a')),
-            ctrl(DashboardKeysym::Char('d')),
-            ctrl(DashboardKeysym::Char('x')),
-            ctrl(DashboardKeysym::Char('c')),
-            ctrl(DashboardKeysym::Char('v')),
-            key(DashboardKeysym::Delete),
+            key(Keysym::Ch('i')),
+            key(Keysym::Ch('a')),
+            key(Keysym::Ch('o')),
+            shift(Keysym::Ch('o')),
+            ctrl(Keysym::Ch('i')),
+            ctrl(Keysym::Ch('a')),
+            ctrl(Keysym::Ch('d')),
+            ctrl(Keysym::Ch('x')),
+            ctrl(Keysym::Ch('c')),
+            ctrl(Keysym::Ch('v')),
+            key(Keysym::Delete),
         ] {
             p.dashboard_key(k);
             p.dashboard_text("x");
-            p.dashboard_key(key(DashboardKeysym::Enter));
+            p.dashboard_key(key(Keysym::Enter));
         }
         let after: Vec<(Id, String)> = p
             .board
@@ -2932,8 +2985,8 @@ mod tests {
         let mut p = seeded();
         p.enter_dashboard();
         let before = p.board.card_count();
-        p.dashboard_key(key(DashboardKeysym::Char('o')));
-        p.dashboard_key(key(DashboardKeysym::Escape));
+        p.dashboard_key(key(Keysym::Ch('o')));
+        p.dashboard_key(key(Keysym::Escape));
         assert_eq!(p.board.card_count(), before);
         assert!(
             p.take_timeline_entries().is_empty(),
@@ -2945,9 +2998,9 @@ mod tests {
     fn escape_in_insert_returns_to_the_board_and_does_not_leave_it() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Char('i')));
+        p.dashboard_key(key(Keysym::Ch('i')));
         assert_eq!(p.mode, BoardMode::Insert);
-        p.dashboard_key(key(DashboardKeysym::Escape));
+        p.dashboard_key(key(Keysym::Escape));
         assert_eq!(p.mode, BoardMode::Board);
         assert_eq!(
             p.take_dashboard_request(),
@@ -2960,7 +3013,7 @@ mod tests {
     fn escape_on_the_board_asks_the_app_to_leave() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Escape));
+        p.dashboard_key(key(Keysym::Escape));
         assert_eq!(p.take_dashboard_request(), Some(DashboardRequest::Leave));
         assert_eq!(p.take_dashboard_request(), None, "two-call semantics");
     }
@@ -2970,9 +3023,9 @@ mod tests {
         let mut p = seeded();
         p.enter_dashboard();
         p.focus = Focus { col: 1, row: 0 };
-        p.dashboard_key(key(DashboardKeysym::Char('i')));
+        p.dashboard_key(key(Keysym::Ch('i')));
         p.dashboard_text("new ");
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Enter));
         assert_eq!(cards(&p, 1), vec!["new kanban ui"]);
     }
 
@@ -2982,20 +3035,17 @@ mod tests {
         p.board.columns[1].cards[0].text = "héllo wörld".to_owned();
         p.enter_dashboard();
         p.focus = Focus { col: 1, row: 0 };
-        p.dashboard_key(key(DashboardKeysym::Char('a')));
-        p.dashboard_key(key(DashboardKeysym::Backspace));
-        p.dashboard_key(key(DashboardKeysym::Home));
-        p.dashboard_key(key(DashboardKeysym::Delete));
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Ch('a')));
+        p.dashboard_key(key(Keysym::Backspace));
+        p.dashboard_key(key(Keysym::Home));
+        p.dashboard_key(key(Keysym::Delete));
+        p.dashboard_key(key(Keysym::Enter));
         assert_eq!(cards(&p, 1), vec!["éllo wörl"]);
     }
 
     #[test]
     fn ctrl_d_and_delete_both_remove_the_focused_card() {
-        for k in [
-            ctrl(DashboardKeysym::Char('d')),
-            key(DashboardKeysym::Delete),
-        ] {
+        for k in [ctrl(Keysym::Ch('d')), key(Keysym::Delete)] {
             let mut p = seeded();
             p.enter_dashboard();
             p.dashboard_key(k);
@@ -3007,9 +3057,9 @@ mod tests {
     fn cut_then_paste_moves_a_card_to_another_column() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(ctrl(DashboardKeysym::Char('x')));
+        p.dashboard_key(ctrl(Keysym::Ch('x')));
         p.focus = Focus { col: 1, row: 0 };
-        p.dashboard_key(ctrl(DashboardKeysym::Char('v')));
+        p.dashboard_key(ctrl(Keysym::Ch('v')));
         assert_eq!(cards(&p, 0), vec!["write docs"]);
         assert_eq!(cards(&p, 1), vec!["kanban ui", "fix login"]);
     }
@@ -3021,8 +3071,8 @@ mod tests {
         // every later edit would land on the wrong card.
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(ctrl(DashboardKeysym::Char('c')));
-        p.dashboard_key(ctrl(DashboardKeysym::Char('v')));
+        p.dashboard_key(ctrl(Keysym::Ch('c')));
+        p.dashboard_key(ctrl(Keysym::Ch('v')));
         let c = &p.board.columns[0].cards;
         assert_eq!(c.len(), 3);
         assert_eq!(c[0].text, c[1].text);
@@ -3033,7 +3083,7 @@ mod tests {
     fn pasting_with_an_empty_clipboard_says_so_instead_of_doing_nothing() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(ctrl(DashboardKeysym::Char('v')));
+        p.dashboard_key(ctrl(Keysym::Ch('v')));
         assert!(p.take_error().is_some());
         assert_eq!(p.board.card_count(), 3);
     }
@@ -3052,9 +3102,9 @@ mod tests {
         let mut p = seeded();
         p.enter_dashboard();
         p.focus = Focus { col: 1, row: 0 };
-        p.dashboard_key(key(DashboardKeysym::Char('i')));
+        p.dashboard_key(key(Keysym::Ch('i')));
         p.dashboard_paste("one\ntwo ");
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Enter));
         assert_eq!(cards(&p, 1), vec!["one twokanban ui"]);
     }
 
@@ -3076,14 +3126,13 @@ mod tests {
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1, "one edit, one undo step");
 
-        let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        p.undo(&entries[0]).unwrap();
         assert_eq!(
             p.board.columns, before,
             "undo must restore the board exactly"
         );
 
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
+        p.redo(&entries[0]).unwrap();
         assert_eq!(
             p.board.columns, after,
             "redo must be the undo's exact inverse"
@@ -3110,16 +3159,16 @@ mod tests {
     fn deleting_a_card_round_trips() {
         round_trips(seeded(), |p| {
             p.focus = Focus { col: 0, row: 1 };
-            p.dashboard_key(ctrl(DashboardKeysym::Char('d')));
+            p.dashboard_key(ctrl(Keysym::Ch('d')));
         });
     }
 
     #[test]
     fn renaming_a_card_round_trips() {
         round_trips(seeded(), |p| {
-            p.dashboard_key(key(DashboardKeysym::Char('a')));
+            p.dashboard_key(key(Keysym::Ch('a')));
             p.dashboard_text(" now");
-            p.dashboard_key(key(DashboardKeysym::Enter));
+            p.dashboard_key(key(Keysym::Enter));
         });
     }
 
@@ -3132,7 +3181,7 @@ mod tests {
         }));
         round_trips(p, |p| {
             p.focus = Focus { col: 1, row: 0 };
-            p.dashboard_key(ctrl(DashboardKeysym::Char('v')));
+            p.dashboard_key(ctrl(Keysym::Ch('v')));
         });
     }
 
@@ -3140,8 +3189,8 @@ mod tests {
     fn a_rename_to_the_same_text_records_nothing() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Char('a')));
-        p.dashboard_key(key(DashboardKeysym::Enter));
+        p.dashboard_key(key(Keysym::Ch('a')));
+        p.dashboard_key(key(Keysym::Enter));
         assert!(p.take_timeline_entries().is_empty());
     }
 
@@ -3152,16 +3201,15 @@ mod tests {
         let rows = p.fetch();
         let key_label = raw_of(&rows[0]).to_owned();
         let before = p.board.clone();
-        let mut err = String::new();
         assert!(p.move_card_sideways(true, &key_label));
         let after = p.board.clone();
         assert_eq!(cards(&p, 1).len(), 2);
 
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        p.undo(&entries[0]).unwrap();
         assert_eq!(p.board.columns, before.columns);
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
+        p.redo(&entries[0]).unwrap();
         assert_eq!(p.board.columns, after.columns);
     }
 
@@ -3175,8 +3223,7 @@ mod tests {
         add_card(&mut p, "first");
         let first_id = p.board.columns[0].cards[1].id;
         let entries = p.take_timeline_entries();
-        let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        p.undo(&entries[0]).unwrap();
 
         add_card(&mut p, "second");
         let second_id = p.board.columns[0].cards[1].id;
@@ -3189,14 +3236,12 @@ mod tests {
         // the list surface, and undo hands this provider whatever it recorded.
         let mut p = seeded();
         let before = p.board.clone();
-        let mut err = String::new();
-        let foreign = TimelineEntry::ProviderOp {
-            provider_idx: 0,
+        let foreign = ProviderOp {
             command: "something-else".to_owned(),
-            payload: FfonElement::Str("not our json".to_owned()),
+            payload: sicompass_pdk::encode_one(&FfonElement::Str("not our json".to_owned())),
             label: "x".to_owned(),
         };
-        sicompass_sdk::block_on(p.undo(&foreign, &mut err));
+        p.undo(&foreign).unwrap();
         assert_eq!(p.board.columns, before.columns);
     }
 
@@ -3204,26 +3249,23 @@ mod tests {
     fn an_undo_says_what_it_undid() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(ctrl(DashboardKeysym::Char('d')));
+        p.dashboard_key(ctrl(Keysym::Ch('d')));
         let entries = p.take_timeline_entries();
         let _ = p.take_announcement();
-        let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        p.undo(&entries[0]).unwrap();
         let said = p.take_announcement().expect("undo must be announced");
         assert!(
-            said.contains(&localize::t("pm-op-delete-card")),
+            said.contains(&localize::t("projectmanagement-op-delete-card")),
             "got {said:?}"
         );
     }
 
     #[test]
     fn every_board_op_resolves_to_a_real_label() {
-        // `record` builds the key as `pm-op-{command}`, so a command whose label
+        // `record` builds the key as `projectmanagement-op-{command}`, so a command whose label
         // is missing renders the key itself into the undo history.
-        register_translations();
-        localize::set_locale("en-US");
         for command in ["add-card", "delete-card", "rename-card", "move-card"] {
-            let key = format!("pm-op-{command}");
+            let key = format!("projectmanagement-op-{command}");
             assert_ne!(localize::t(&key), key, "{key} has no label");
         }
     }
@@ -3235,7 +3277,7 @@ mod tests {
         let mut p = seeded();
         p.enter_dashboard();
         p.clear_needs_refresh();
-        p.dashboard_key(ctrl(DashboardKeysym::Char('d')));
+        p.dashboard_key(ctrl(Keysym::Ch('d')));
         assert!(p.needs_refresh());
     }
 
@@ -3259,11 +3301,8 @@ mod tests {
         p.enter_dashboard();
         p.focus = Focus { col: 1, row: 0 };
         p.leave_dashboard();
-        assert_eq!(
-            p.take_navigation_request(),
-            Some(NavigationRequest::SelectPath(vec![1, 0]))
-        );
-        assert_eq!(p.take_navigation_request(), None, "two-call semantics");
+        assert_eq!(nav(&mut p), Some(vec![1, 0]));
+        assert_eq!(nav(&mut p), None, "two-call semantics");
     }
 
     #[test]
@@ -3275,30 +3314,25 @@ mod tests {
         p.enter_dashboard();
         p.focus = Focus { col: 2, row: 0 };
         p.leave_dashboard();
-        assert_eq!(p.take_navigation_request(), None);
+        assert_eq!(nav(&mut p), None);
     }
 
     #[test]
     fn leaving_mid_edit_keeps_the_text_and_still_follows_the_card() {
         let mut p = seeded();
         p.enter_dashboard();
-        p.dashboard_key(key(DashboardKeysym::Char('o')));
+        p.dashboard_key(key(Keysym::Ch('o')));
         p.dashboard_text("half typed");
         p.leave_dashboard();
         assert_eq!(cards(&p, 0)[1], "half typed", "leaving is not a cancel");
-        assert_eq!(
-            p.take_navigation_request(),
-            Some(NavigationRequest::SelectPath(vec![0, 1]))
-        );
+        assert_eq!(nav(&mut p), Some(vec![0, 1]));
     }
 
     #[test]
     fn the_board_declares_it_wants_the_apps_undo() {
-        assert!(ProjectManagementProvider::new().dashboard_uses_app_undo());
-        assert_eq!(
-            ProjectManagementProvider::new().dashboard_kind(),
-            DashboardKind::Interactive
-        );
+        let d = ProjectManagementProvider::new().describe();
+        assert!(d.dashboard_uses_app_undo);
+        assert!(matches!(d.dashboard_kind, DashboardKind::Interactive));
     }
 
     // ---- The archive ----------------------------------------------------
@@ -3306,10 +3340,10 @@ mod tests {
     /// Archive whatever `elem_key` names, through the same entry point the app
     /// uses. `elem_key` is ignored on the board, which is the point of it.
     fn archive(p: &mut ProjectManagementProvider, elem_key: &str) {
-        let mut err = String::new();
-        let out = p.handle_command(CMD_ARCHIVE, elem_key, 0, &mut err);
+        let out = p
+            .handle_command(CMD_ARCHIVE, elem_key, 0)
+            .unwrap_or_else(|err| panic!("and must never set an error: {err}"));
         assert!(out.is_none(), "the archive command must return no element");
-        assert!(err.is_empty(), "and must never set an error: {err}");
     }
 
     /// The row label the list cursor would be on, for a card in a column.
@@ -3322,7 +3356,7 @@ mod tests {
 
     /// Every character the board actually draws.
     fn board_text(p: &mut ProjectManagementProvider) -> String {
-        let f = p.dashboard_render(120, 40);
+        let f = p.render_frame(120, 40);
         (0..f.rows)
             .map(|y| (0..f.cols).map(|x| f.cell(x, y).ch).collect::<String>())
             .collect::<Vec<_>>()
@@ -3392,8 +3426,8 @@ mod tests {
         let key = row_key(&mut p, "To do", "write docs");
         archive(&mut p, &key);
         assert_eq!(
-            p.take_navigation_request(),
-            Some(NavigationRequest::SelectPath(vec![0])),
+            nav(&mut p),
+            Some(vec![0]),
             "without this the app unwinds the cursor to the board root"
         );
     }
@@ -3405,7 +3439,7 @@ mod tests {
         let mut p = seeded();
         p.enter_dashboard();
         archive(&mut p, "");
-        assert_eq!(p.take_navigation_request(), None);
+        assert_eq!(nav(&mut p), None);
     }
 
     #[test]
@@ -3417,12 +3451,12 @@ mod tests {
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
         assert!(
-            matches!(&entries[0], TimelineEntry::ProviderOp { command, .. } if command == "archive-card"),
+            entries[0].command == "archive-card",
             "the undo screen must not call this a move: {:?}",
             entries[0]
         );
 
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut String::new()));
+        p.undo(&entries[0]).unwrap();
         assert_eq!(
             cards(&p, 0),
             vec!["fix login", "write docs"],
@@ -3430,7 +3464,7 @@ mod tests {
         );
         assert_eq!(cards(&p, 2), Vec::<String>::new());
 
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut String::new()));
+        p.redo(&entries[0]).unwrap();
         assert_eq!(cards(&p, 0), vec!["fix login"]);
         assert_eq!(cards(&p, 2), vec!["write docs"]);
     }
@@ -3443,7 +3477,7 @@ mod tests {
         p.enter_dashboard();
         archive(&mut p, "");
         let entries = p.take_timeline_entries();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut String::new()));
+        p.undo(&entries[0]).unwrap();
         assert!(p.board.archive_id().is_some());
         assert_eq!(p.board.columns.len(), 3);
     }
@@ -3553,7 +3587,7 @@ mod tests {
         p.enter_dashboard();
         archive(&mut p, "");
         p.focus = Focus { col: 1, row: 0 };
-        p.dashboard_key(key(DashboardKeysym::Right));
+        p.dashboard_key(key(Keysym::Right));
         assert_eq!(p.focus.col, 1, "right from the last real column stays put");
     }
 
@@ -3678,10 +3712,8 @@ mod tests {
     fn the_display_name_matches_the_factory_key_once_spaces_are_stripped() {
         // The settings panel matches a section to a provider that way; a mismatch
         // silently drops the section rather than failing anywhere visible.
-        register_translations();
-        localize::set_locale("en-US");
-        let p = ProjectManagementProvider::new();
-        assert_eq!(p.display_name().replace(' ', ""), p.name());
+        let d = ProjectManagementProvider::new().describe();
+        assert_eq!(d.display_name.replace(' ', ""), d.name);
     }
 
     #[test]
@@ -3708,13 +3740,22 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `localize::t` hands back the key when a string is missing, so a
-    /// forgotten entry would show in Settings as `pm-checkbox-cloud-backup`.
+    /// forgotten entry would show in Settings as `projectmanagement-checkbox-cloud-backup`.
     #[test]
     fn the_cloud_backup_checkbox_label_resolves() {
-        register_translations();
-        let label = localize::t("pm-checkbox-cloud-backup");
-        assert_ne!(label, "pm-checkbox-cloud-backup");
+        let label = localize::t("projectmanagement-checkbox-cloud-backup");
+        assert_ne!(label, "projectmanagement-checkbox-cloud-backup");
         assert!(label.contains("cloud"), "{label}");
+    }
+
+    /// Every message the backup service can show, under this plugin's
+    /// prefix. A missing one would show as its id.
+    #[test]
+    fn every_cloud_message_resolves() {
+        for id in sicompass_payments::cloud::MESSAGES {
+            let id = format!("projectmanagement-{id}");
+            assert_ne!(localize::t(&id), id);
+        }
     }
 
     /// With the switch off, nothing about payment appears anywhere. A user who
@@ -3731,25 +3772,25 @@ mod tests {
 
     #[test]
     fn the_cloud_row_leads_the_columns_level_once_switched_on() {
-        let mut p = seeded_with_cloud(LicenseStatus::None);
+        let mut p = seeded_with_cloud(Standing::Missing);
         let rendered = p.fetch();
-        let FfonElement::Obj(first) = &rendered[0] else {
-            panic!("the cloud row must be an Obj so the app will follow it");
+        // A plain row: it says where the user stands and links nowhere, since
+        // buying and redeeming are in store, tiers.
+        let FfonElement::Str(first) = &rendered[0] else {
+            panic!("the cloud row is a plain row, not something to follow");
         };
-        assert!(
-            first.key.contains("<link>http://127.0.0.1:1/cloud</link>"),
-            "{}",
-            first.key
-        );
+        assert!(cloud::is_row(first), "{first}");
+        assert!(!first.contains("<link>"), "{first}");
         // And the board is still there, below it.
         let shown = labels(&rendered);
+        assert!(shown[0].contains("store, tiers"), "{shown:?}");
         assert!(shown.iter().any(|l| l == "To do"), "{shown:?}");
         assert!(shown.iter().any(|l| l == "Doing"), "{shown:?}");
     }
 
     #[test]
     fn the_cloud_row_wording_changes_once_it_is_paid_for() {
-        let unpaid = labels(&seeded_with_cloud(LicenseStatus::None).fetch())[0].clone();
+        let unpaid = labels(&seeded_with_cloud(Standing::Missing).fetch())[0].clone();
         let paid = labels(&seeded_with_cloud(active_licence()).fetch())[0].clone();
         assert_ne!(unpaid, paid);
         assert!(paid.contains("342"), "{paid}");
@@ -3769,15 +3810,17 @@ mod tests {
     /// line: the cloud row is not board content.
     #[test]
     fn an_empty_board_keeps_its_placeholder_beside_the_cloud_row() {
-        sicompass_payments::config::_set_test_no_persist(true);
-        sicompass_payments::cloud::_set_test_status(Some(active_licence()));
-        let mut p = ProjectManagementProvider::new();
+        let mut p = ProjectManagementProvider::with_host(Box::new(FakeHost::new(active_licence())));
         p.loaded = true;
-        p.on_setting_change(CLOUD_ENABLE_KEY, "true");
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
 
         let shown = labels(&p.fetch());
         assert_eq!(shown.len(), 2, "{shown:?}");
-        assert_eq!(shown[1], localize::t("pm-empty-columns"), "{shown:?}");
+        assert_eq!(
+            shown[1],
+            localize::t("projectmanagement-empty-columns"),
+            "{shown:?}"
+        );
     }
 
     /// The one that would eat a user's board. The app hands back whatever it
@@ -3785,10 +3828,9 @@ mod tests {
     /// column the moment anything else is typed.
     #[test]
     fn the_cloud_row_is_never_stored_as_a_column() {
-        let mut p = seeded_with_cloud(LicenseStatus::None);
+        let mut p = seeded_with_cloud(Standing::Missing);
         let unchanged = p.fetch();
-        assert!(matches!(&unchanged[0],
-            FfonElement::Obj(o) if sicompass_payments::cloud::CloudBackup::is_row(&o.key)));
+        assert!(matches!(&unchanged[0], FfonElement::Str(s) if cloud::is_row(s)));
         p.sync_ffon_body_children(&unchanged);
 
         let titles: Vec<String> = p.board.columns.iter().map(|c| c.title.clone()).collect();
@@ -3799,41 +3841,22 @@ mod tests {
         );
     }
 
-    /// An edit made on the grafted payment page must not rewrite the board.
+    /// The backup row belongs to the switch in settings, not to the board.
     #[test]
-    fn an_edit_on_the_payment_page_does_not_touch_the_board() {
+    fn the_cloud_row_cannot_be_deleted() {
         let mut p = seeded_with_cloud(active_licence());
-        p.fetch();
-
-        // What the server's /cloud tree looks like once the app has grafted it
-        // into this provider and the user has typed into one of its inputs.
-        let tier_page = vec![
-            FfonElement::new_str("Enable 'cloud and store' per month"),
-            FfonElement::new_str("Lemonsqueezy setup: <input>acct-1</input>"),
-            FfonElement::new_obj("<radio>monthly or yearly"),
-            FfonElement::new_str("<button>checkout:cloud</button>for payment"),
-            FfonElement::new_str("License redeem token: <input>tok-42</input>"),
-        ];
-        p.sync_ffon_body_children(&tier_page);
-
-        let titles: Vec<String> = p.board.columns.iter().map(|c| c.title.clone()).collect();
-        assert_eq!(
-            titles,
-            vec!["To do".to_owned(), "Doing".to_owned()],
-            "the checkout form must never become the board: {titles:?}"
-        );
+        let row = raw_of(&p.fetch()[0]).to_owned();
+        assert!(!p.delete_item(&row));
+        assert!(p.take_error().is_some());
     }
 
     #[test]
     fn switching_on_without_a_subscription_is_announced() {
-        sicompass_payments::config::_set_test_no_persist(true);
-        sicompass_payments::cloud::_set_test_status(Some(LicenseStatus::None));
-        let mut p = seeded();
-        p.on_setting_change(CLOUD_ENABLE_KEY, "true");
+        let mut p = seeded_with_cloud(Standing::Missing);
         let spoken = p
             .take_announcement()
             .expect("the screen reader must say why");
-        assert!(spoken.contains("cloud and store"), "{spoken}");
+        assert!(spoken.contains("Sicompass Cloud"), "{spoken}");
     }
 
     #[test]
@@ -3848,20 +3871,130 @@ mod tests {
     #[test]
     fn restore_refuses_to_overwrite_an_existing_board() {
         let dir = TempDir::new().unwrap();
-        sicompass_payments::cloud::_set_test_status(Some(active_licence()));
-        let mut p = provider(&dir);
-        p.on_setting_change("storeUrl", "http://127.0.0.1:1");
-        p.on_setting_change(CLOUD_ENABLE_KEY, "true");
-        p.on_setting_change("licenseRedeemToken", "tok-42");
+        let host = FakeHost::new(active_licence());
+        let mut p = provider_on(&dir, &host);
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
         p.ensure_loaded();
         p.board.columns.push(Column::new(1, "To do"));
         p.persist();
 
-        let mut err = String::new();
-        p.handle_command(CMD_RESTORE_BACKUP, "", 0, &mut err);
+        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
 
         assert!(p.take_error().is_some(), "the refusal has to be reported");
+        assert!(
+            !host.spawned().iter().any(|(t, _)| t == cloud::TASK_RESTORE),
+            "refused before anything reaches the network"
+        );
         assert_eq!(p.board.columns.len(), 1);
         assert_eq!(p.board.columns[0].title, "To do");
+    }
+
+    /// Over an empty board the restore is a task; when it has written the
+    /// server's copy, the board is read again and the outcome is spoken.
+    #[test]
+    fn a_finished_restore_reloads_the_board() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = provider_on(&dir, &host);
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
+        p.fetch();
+        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
+        assert_eq!(
+            host.spawned(),
+            vec![(cloud::TASK_RESTORE.to_owned(), Vec::new())]
+        );
+
+        // What the task wrote, from its own instance.
+        let mut elsewhere = provider(&dir);
+        elsewhere.ensure_loaded();
+        elsewhere
+            .board
+            .columns
+            .push(Column::new(1, "From the cloud"));
+        elsewhere.persist();
+
+        p.on_task_event(1, TaskEvent::Done(Ok(b"restored".to_vec())));
+        let poll = p.poll();
+        assert!(poll.needs_refresh);
+        assert!(poll.announcement.is_some_and(|a| a.contains("restored")));
+        assert!(labels(&p.fetch()).contains(&"From the cloud".to_owned()));
+    }
+
+    /// An upload waits until the board has been quiet, then runs as a task.
+    #[test]
+    fn a_backup_starts_once_the_board_is_quiet() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(Standing::Grace { days_left: 2 });
+        let mut p = provider_on(&dir, &host);
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
+        p.ensure_loaded();
+        p.board.columns.push(Column::new(1, "To do"));
+        p.persist();
+
+        host.advance(1_000);
+        p.poll();
+        assert!(host.spawned().is_empty(), "still arranging");
+
+        host.advance(sicompass_payments::debounce::DEBOUNCE_MS);
+        assert!(p.poll().is_busy);
+        assert_eq!(
+            host.spawned(),
+            vec![(cloud::TASK_BACKUP.to_owned(), Vec::new())]
+        );
+    }
+
+    /// The paywall is on the service: without a subscription the board is
+    /// still saved, and only the upload does not happen.
+    #[test]
+    fn nothing_is_uploaded_without_a_subscription() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(Standing::Expired { days_ago: 30 });
+        let mut p = provider_on(&dir, &host);
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
+        p.ensure_loaded();
+        p.board.columns.push(Column::new(1, "To do"));
+        p.persist();
+        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        p.poll();
+        assert!(host.spawned().is_empty());
+        assert!(store::load_board(&dir.path().join("board")).is_some_and(|b| b.columns.len() == 1));
+    }
+
+    /// The board's poll carries the requests the dashboard used to hand over
+    /// one by one: leaving, and where the list cursor should land.
+    #[test]
+    fn poll_hands_over_the_dashboards_requests() {
+        let mut p = seeded();
+        p.enter_dashboard();
+        p.dashboard_key(key(Keysym::Escape));
+        let poll = p.poll();
+        assert!(matches!(
+            poll.dashboard_request,
+            Some(DashboardRequest::Leave)
+        ));
+        p.leave_dashboard();
+        assert!(matches!(
+            p.poll().navigation_request,
+            Some(NavigationRequest::SelectPath(ref at)) if at == &[0, 0]
+        ));
+    }
+
+    /// The frame crosses to the host cell for cell.
+    #[test]
+    fn the_frame_crosses_the_plugin_interface_unchanged() {
+        let mut p = seeded();
+        p.enter_dashboard();
+        let ours = p.render_frame(60, 12);
+        let theirs = p.dashboard_render(60, 12);
+        assert_eq!((theirs.cols, theirs.rows), (ours.cols, ours.rows));
+        assert_eq!(theirs.cells.len(), ours.cells.len());
+        assert!(
+            ours.cells
+                .iter()
+                .zip(&theirs.cells)
+                .all(|(a, b)| a.ch == b.ch && a.fg == b.fg && a.bg == b.bg)
+        );
+        assert_eq!(theirs.cursor, ours.cursor);
+        assert_eq!(theirs.half_gap_rows, ours.half_gap_rows);
     }
 }
