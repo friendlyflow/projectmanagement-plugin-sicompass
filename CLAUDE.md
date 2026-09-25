@@ -123,7 +123,7 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/projectmanagement.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK, the pdk and `sicompass-payments` (all in `../sicompass-plugin-sdk`)
-come by git at one rev until they are on crates.io. The commented-out
-`[patch]` in `Cargo.toml` is for working on them together, and stays commented
-on main.
+The SDK and the pdk come from crates.io, and `sicompass-payments` by git at the
+SDK's release tag (the source is all in `../sicompass-plugin-sdk`). The
+commented-out `[patch]` in `Cargo.toml` is for working on them together, and
+stays commented on main.
