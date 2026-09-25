@@ -8,7 +8,7 @@ version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Project management for sicompass: a kanban board in a list and on a grid, with optional cloud backup, as a WASM plugin"
-repository = "https://github.com/friendlyflow/projectmanagement_plugin_sicompass"
+repository = "https://github.com/friendlyflow/projectmanagement-plugin-sicompass"
 # A plugin ships as a signed release the sicompass Store installs, never on crates.io.
 publish = false
 

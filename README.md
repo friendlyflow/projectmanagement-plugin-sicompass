@@ -1,4 +1,4 @@
-# projectmanagement_plugin_sicompass
+# projectmanagement-plugin-sicompass
 
 *A kanban board, in Sicompass.*
 

@@ -1,9 +1,9 @@
 {
   # Skeleton for a sicompass WASM plugin, from sicompass's /split-repo. Fill in
-  # projectmanagement_plugin_sicompass: a kanban board, with optional cloud backup, a sicompass WASM plugin. The plugin is built for wasm32-wasip2, which nixpkgs' rustc
+  # projectmanagement-plugin-sicompass: a kanban board, with optional cloud backup, a sicompass WASM plugin. The plugin is built for wasm32-wasip2, which nixpkgs' rustc
   # has no std for, so the toolchain comes from rust-overlay (as in
   # sicompass-plugin-sdk's flake). flake.lock pins it.
-  description = "projectmanagement_plugin_sicompass: a kanban board, with optional cloud backup, a sicompass WASM plugin";
+  description = "projectmanagement-plugin-sicompass: a kanban board, with optional cloud backup, a sicompass WASM plugin";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
