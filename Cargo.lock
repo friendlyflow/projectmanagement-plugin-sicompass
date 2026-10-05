@@ -109,7 +109,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.6",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -806,7 +806,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 [[package]]
 name = "sicompass-payments"
 version = "0.2.0"
-source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?tag=v0.9.0#2b535cc15ae8ef668a26fc3bb6e0f42c288ee087"
+source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?tag=v0.9.1#20b7e7e3394cda60bf622ca7291ef3b23d7c2f52"
 dependencies = [
  "serde",
  "serde_json",
@@ -816,7 +816,8 @@ dependencies = [
 [[package]]
 name = "sicompass-sdk"
 version = "0.9.1"
-source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=06a9037b5a1194be87af786bdfde928be173473e#06a9037b5a1194be87af786bdfde928be173473e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87268b7bdc44757a5612bb692d9771ae7d60787ebfedbe969895c8a8329fd00b"
 dependencies = [
  "async-trait",
  "libc",
