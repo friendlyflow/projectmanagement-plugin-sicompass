@@ -1,8 +1,9 @@
 //! The project-management plugin. Its first feature is a kanban board.
 //!
-//! A sicompass WASM plugin. The board lives in the plugin's own folder
-//! (`"storage": true`, which the host maps to the same directory the built-in
-//! used, so nothing moves), and the optional cloud backup is in [`cloud`].
+//! A sicompass plugin: a program sicompass starts (`src/main.rs`), with the
+//! user's rights. The board lives in the plugin's own folder (`"storage":
+//! true`, the same directory the built-in used, so nothing moves), and the
+//! optional cloud backup is in [`cloud`].
 //!
 //! # Two surfaces, one board
 //!
@@ -75,12 +76,12 @@ pub mod store;
 
 use cloud::{Cloud, CloudHost, Finished, PluginHost};
 use serde::{Deserialize, Serialize};
-use sicompass_pdk::{
-    DashboardKind, DashboardRequest, Descriptor, Key, Keysym, NavigationRequest, Plugin,
-    PollResult, ProviderOp, TaskEvent, export_plugin,
-};
 use sicompass_sdk::ffon::FfonElement;
 use sicompass_sdk::input::{self, InputLine, InputState};
+use sicompass_sdk::plugin::{
+    DashboardKind, DashboardRequest, Descriptor, Key, Keysym, NavigationRequest, Plugin,
+    PollResult, ProviderOp,
+};
 use sicompass_sdk::tags;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -244,8 +245,8 @@ pub struct ProjectManagementProvider {
     /// Displayed label back to the id it names, per level. `push_path` is handed
     /// the label the user was looking at, not an id.
     labels: HashMap<Option<Id>, HashMap<String, Id>>,
-    /// Per-instance store location, for the tests. Inside the sandbox the
-    /// store is the plugin's own folder, `/storage`.
+    /// Per-instance store location, for the tests. In sicompass the store is
+    /// the plugin's own folder, [`sicompass_sdk::plugin::storage_dir`].
     root_override: Option<PathBuf>,
     loaded: bool,
     load_failed: bool,
@@ -336,16 +337,16 @@ impl ProjectManagementProvider {
     /// Where the board lives. `None` means nowhere usable, and the board stays in
     /// memory for the session rather than being silently discarded.
     ///
-    /// In the sandbox that is `/storage`, which the host maps to the plugin's
-    /// own folder in the data directory (not the state directory: on macOS that
-    /// is `~/Library/Logs`, which cleanup tools treat as disposable, and a board
-    /// is a document). Natively, in the unit tests, nothing unless a test set
-    /// one: a test that forgot must fail closed, never reach a real board.
+    /// In sicompass that is the plugin's own folder, which the app creates in
+    /// the data directory (not the state directory: on macOS that is
+    /// `~/Library/Logs`, which cleanup tools treat as disposable, and a board is
+    /// a document). Outside sicompass, in the unit tests, nothing unless a test
+    /// set one: a test that forgot must fail closed, never reach a real board.
     fn root(&self) -> Option<PathBuf> {
         if let Some(p) = &self.root_override {
             return Some(p.clone());
         }
-        cfg!(target_arch = "wasm32").then(|| PathBuf::from(sicompass_pdk::STORAGE_DIR))
+        sicompass_sdk::plugin::storage_dir()
     }
 
     pub fn at_root(&self) -> bool {
@@ -439,7 +440,7 @@ impl ProjectManagementProvider {
     /// Pull the cloud backup back over an empty board.
     ///
     /// A background task. Its outcome is spoken when it ends
-    /// ([`Plugin::on_task_event`]): "nothing was restored" and "restored" both
+    /// ([`ProjectManagementProvider::task_done`]): "nothing was restored" and "restored" both
     /// need saying, and only one of them is an error. A board with columns is
     /// refused here already, before anything reaches the network.
     fn restore_cloud_backup(&mut self) {
@@ -713,7 +714,7 @@ impl ProjectManagementProvider {
         let payload = serde_json::to_string(&op).unwrap_or_default();
         self.timeline.push(ProviderOp {
             command: op.command().to_owned(),
-            payload: sicompass_pdk::encode_one(&FfonElement::Str(payload)),
+            payload: sicompass_sdk::plugin::encode_one(&FfonElement::Str(payload)),
             label,
         });
     }
@@ -1495,7 +1496,7 @@ fn row_text(raw: &str) -> String {
 
 impl Plugin for ProjectManagementProvider {
     fn new() -> Self {
-        ProjectManagementProvider::with_host(Box::new(PluginHost))
+        ProjectManagementProvider::with_host(Box::new(PluginHost::new()))
     }
 
     fn describe(&self) -> Descriptor {
@@ -1517,7 +1518,7 @@ impl Plugin for ProjectManagementProvider {
     /// Pick up the backup switch as the user left it, quietly: the "needs a
     /// subscription" notice is for the moment they switch it on.
     fn init(&mut self) {
-        let on = sicompass_pdk::host::get_setting(cloud::ENABLE_KEY);
+        let on = sicompass_sdk::plugin::host::get_setting(cloud::ENABLE_KEY);
         self.cloud.restore_enabled(on.as_deref() == Some("true"));
     }
 
@@ -1529,6 +1530,9 @@ impl Plugin for ProjectManagementProvider {
     /// Every frame: start a backup once the board has been quiet long enough,
     /// and hand over whatever needs saying or doing.
     fn poll(&mut self) -> PollResult {
+        for (id, result) in self.host.finished() {
+            self.task_done(id, result);
+        }
         self.cloud.tick(&*self.host);
         let needs_refresh = self.needs_refresh();
         self.clear_needs_refresh();
@@ -1760,44 +1764,9 @@ impl Plugin for ProjectManagementProvider {
         Ok(ok.then(|| FfonElement::new_str("")))
     }
 
-    /// In a fresh worker instance: the upload or the restore. Everything it
-    /// needs is on disk or from the host, so `input` carries only the hash of
-    /// the last upload.
-    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
-        let root = self.root().ok_or("the board has no folder")?;
-        let token = self.host.token();
-        let service = &cloud::SERVICE;
-        match name {
-            cloud::TASK_BACKUP => sicompass_payments::cloud::run_backup(
-                service,
-                &root,
-                input,
-                token,
-                &cloud::net_send,
-            ),
-            cloud::TASK_RESTORE => {
-                sicompass_payments::cloud::run_restore(service, &root, token, &cloud::net_send)
-            }
-            other => Err(format!("no task named `{other}`")),
-        }
-    }
-
-    fn on_task_event(&mut self, id: u64, event: TaskEvent) {
-        let TaskEvent::Done(result) = event else {
-            return;
-        };
-        if self.cloud.on_task_done(id, result, &*self.host) == Finished::Restored {
-            // The board in memory is stale: re-read what the task wrote.
-            self.loaded = false;
-            self.load_failed = false;
-            self.ensure_loaded();
-            self.refresh = true;
-        }
-    }
-
     // ---- The board ------------------------------------------------------
 
-    fn set_dashboard_palette(&mut self, palette: sicompass_pdk::Palette) {
+    fn set_dashboard_palette(&mut self, palette: sicompass_sdk::plugin::Palette) {
         self.palette = to_sdk_palette(palette);
     }
 
@@ -1860,8 +1829,8 @@ impl Plugin for ProjectManagementProvider {
         }
     }
 
-    fn dashboard_render(&mut self, cols: u16, rows: u16) -> sicompass_pdk::Frame {
-        to_frame(self.render_frame(cols, rows))
+    fn dashboard_render(&mut self, cols: u16, rows: u16) -> sicompass_sdk::plugin::Frame {
+        self.render_frame(cols, rows).into()
     }
 
     fn dashboard_key(&mut self, key: Key) -> bool {
@@ -2048,11 +2017,25 @@ impl ProjectManagementProvider {
     }
 }
 
+impl ProjectManagementProvider {
+    /// A background task ([`cloud::PluginHost`] runs them on threads) ended.
+    /// `poll` hands each one over, in the order they finished.
+    pub fn task_done(&mut self, id: u64, result: Result<Vec<u8>, String>) {
+        if self.cloud.on_task_done(id, result, &*self.host) == Finished::Restored {
+            // The board in memory is stale: re-read what the task wrote.
+            self.loaded = false;
+            self.load_failed = false;
+            self.ensure_loaded();
+            self.refresh = true;
+        }
+    }
+}
+
 /// Read a board op back out of a timeline entry, with its localized label.
 ///
 /// Anything that is not one of ours is ignored rather than guessed at.
 fn decode_op(entry: &ProviderOp) -> Option<(BoardOp, String)> {
-    let payload = sicompass_pdk::decode_one(&entry.payload)?;
+    let payload = sicompass_sdk::plugin::decode_one(&entry.payload)?;
     let json = payload.as_str()?;
     let op: BoardOp = serde_json::from_str(json).ok()?;
     Some((op, entry.label.clone()))
@@ -2062,11 +2045,11 @@ fn decode_op(entry: &ProviderOp) -> Option<(BoardOp, String)> {
 // The renderer's types and the plugin interface's
 //
 // `render` draws in the SDK's dashboard types, which is what its tests read.
-// The plugin interface has its own, generated from the WIT, so the palette is
-// converted on the way in and the frame on the way out.
+// The plugin interface has its own wire types, so the palette is converted on
+// the way in, and the frame on the way out (the SDK's `From`).
 // ---------------------------------------------------------------------------
 
-fn to_sdk_palette(p: sicompass_pdk::Palette) -> sicompass_sdk::DashboardPalette {
+fn to_sdk_palette(p: sicompass_sdk::plugin::Palette) -> sicompass_sdk::DashboardPalette {
     sicompass_sdk::DashboardPalette {
         background: p.background,
         text: p.text,
@@ -2077,42 +2060,6 @@ fn to_sdk_palette(p: sicompass_pdk::Palette) -> sicompass_sdk::DashboardPalette 
         error: p.error,
     }
 }
-
-fn to_frame(f: sicompass_sdk::DashboardFrame) -> sicompass_pdk::Frame {
-    use sicompass_pdk::{Cell, CellAttrs, CursorStyle, Frame, Selection};
-    Frame {
-        cols: f.cols,
-        rows: f.rows,
-        cells: f
-            .cells
-            .into_iter()
-            .map(|c| Cell {
-                ch: c.ch,
-                fg: c.fg,
-                bg: c.bg,
-                attrs: CellAttrs {
-                    bold: c.attrs.bold,
-                    underline: c.attrs.underline,
-                    reverse: c.attrs.reverse,
-                },
-            })
-            .collect(),
-        cursor: f.cursor,
-        selection: f.selection.map(|s| Selection {
-            col: s.col,
-            row: s.row,
-            cols: s.cols,
-            rows: s.rows,
-        }),
-        half_gap_rows: f.half_gap_rows,
-        cursor_style: match f.cursor_style {
-            sicompass_sdk::DashboardCursor::Block => CursorStyle::Block,
-            sicompass_sdk::DashboardCursor::Bar => CursorStyle::Bar,
-        },
-    }
-}
-
-export_plugin!(ProjectManagementProvider);
 
 #[cfg(test)]
 mod tests {
@@ -3238,7 +3185,9 @@ mod tests {
         let before = p.board.clone();
         let foreign = ProviderOp {
             command: "something-else".to_owned(),
-            payload: sicompass_pdk::encode_one(&FfonElement::Str("not our json".to_owned())),
+            payload: sicompass_sdk::plugin::encode_one(&FfonElement::Str(
+                "not our json".to_owned(),
+            )),
             label: "x".to_owned(),
         };
         p.undo(&foreign).unwrap();
@@ -3904,7 +3853,7 @@ mod tests {
             vec![(cloud::TASK_RESTORE.to_owned(), Vec::new())]
         );
 
-        // What the task wrote, from its own instance.
+        // What the task wrote, from its own thread.
         let mut elsewhere = provider(&dir);
         elsewhere.ensure_loaded();
         elsewhere
@@ -3913,7 +3862,7 @@ mod tests {
             .push(Column::new(1, "From the cloud"));
         elsewhere.persist();
 
-        p.on_task_event(1, TaskEvent::Done(Ok(b"restored".to_vec())));
+        p.task_done(1, Ok(b"restored".to_vec()));
         let poll = p.poll();
         assert!(poll.needs_refresh);
         assert!(poll.announcement.is_some_and(|a| a.contains("restored")));
@@ -4028,7 +3977,11 @@ mod tutorial_text_tests {
     #[test]
     fn every_language_has_the_same_tutorial_leaves() {
         let en = tutorial_ids(LOCALES[0].1);
-        assert_eq!(en, ["projectmanagement-tutorial", "projectmanagement-tutorial-2"], "en-US's tutorial leaves");
+        assert_eq!(
+            en,
+            ["projectmanagement-tutorial", "projectmanagement-tutorial-2"],
+            "en-US's tutorial leaves"
+        );
         for (locale, ftl) in &LOCALES[1..] {
             assert_eq!(tutorial_ids(ftl), en, "{locale} has drifted from en-US");
         }

@@ -8,30 +8,35 @@ Work on it is usually driven from a sicompass checkout next to this one
 `/update-cargo` take this repo's name as their first argument and then follow
 the skills in this repo's `.claude/skills/`.
 
-It is a sicompass **WASM plugin**: a `cdylib` built for `wasm32-wasip2` with
-`sicompass-pdk`, installed by the sicompass Store from this repo's GitHub
-releases. The plugin platform is described in
-`../sicompass/docs/plugin-platform.md` and `../sicompass/docs/wasm-plugins.md`.
+It is a sicompass **plugin process**: a program (`src/main.rs`) built with the
+SDK's `plugin` feature, which sicompass starts and talks to over its stdin and
+stdout. It runs with the user's rights. The Store installs it from this repo's
+GitHub releases, one build per platform. The plugin platform is described in
+`../sicompass/docs/plugin-platform.md`.
 
 - `plugin.json` is the manifest. Its `name` (`projectmanagement`, no space, so
   `displayName.replace(' ', "")` equals it) is also the install folder, the
   settings section and the storage folder, and its `version` must equal the
-  release tag. Permissions: `storage` (the board, at `/storage` in the
-  sandbox, which the host maps to `<data dir>/projectmanagement`, the folder
-  the old built-in used, so existing boards open unchanged) and `allowedHosts
-  ["store.sicompass.org"]` (the backup server). `service.tier` is
+  release tag. Permissions, which declare what the plugin does and are shown
+  to the user before install: `storage` (the board, in
+  `sicompass_sdk::plugin::storage_dir()`, which is
+  `<data dir>/projectmanagement`, the folder the old built-in used, so existing
+  boards open unchanged) and `allowedHosts ["store.sicompass.org"]` (the
+  backup server). `service.tier` is
   `friendlyflow/cloud`, which is what lets `license::token` hand this plugin
   the user's Sicompass Cloud redeem token.
 - `locales/<lang>.ftl`, every id prefixed `projectmanagement-`, in all four
-  languages. `src/localize.rs` asks the host inside the sandbox and reads
-  `en-US.ftl` natively, so the unit tests see the English text.
+  languages. `src/localize.rs` asks the app (`host::translate`), and in the
+  unit tests, which run outside sicompass, reads `en-US.ftl`, so they see the
+  English text.
 - `src/lib.rs` is the plugin (`ProjectManagementProvider`, `impl Plugin`):
   the list surface, the board dashboard and its keys, and board undo.
-  `board.rs` is the model, `store.rs` the on-disk format, `render.rs` draws
+  `src/main.rs` makes it the program. `board.rs` is the model, `store.rs` the on-disk format, `render.rs` draws
   the board, `escape.rs` escapes every row.
 - `src/cloud.rs` is the optional cloud backup (the server store is named
   `kanban`, settings key `kanbanCloudBackup`), on the `sicompass-payments`
-  guest library.
+  library, with a host of its own (`PluginHost`): the app through the plugin
+  kit, threads for the tasks, and `ureq` (rustls) for the HTTP.
 
 ## Two surfaces, one board
 
@@ -46,9 +51,9 @@ surface. In short:
   `Plugin::undo`. `dashboard_uses_app_undo` puts them on the app's timeline.
 - **`render.rs` draws in the SDK's dashboard types** (`DashboardFrame`,
   `DashboardPalette`), which its tests read. The plugin interface has its own
-  generated types, so `to_sdk_palette` and `to_frame` convert at the boundary.
-  Keys, dashboard requests and navigation requests use the interface's types
-  throughout.
+  wire types, so `to_sdk_palette` converts the palette on the way in and the
+  SDK's `From<DashboardFrame>` the frame on the way out. Keys, dashboard
+  requests and navigation requests use the interface's types throughout.
 - **The archive is an ordinary column**, pinned last, which the board stops
   drawing one short of. `clamp_focus` is what keeps the board cursor off it.
 
@@ -61,17 +66,20 @@ surface. In short:
   and `reconcile_columns` skips it. The app hands back whatever it displayed,
   so without that the row becomes a column. It never links anywhere: buying
   and redeeming are in the Store, under tiers.
-- **Nothing slow runs in the UI instance.** `persist` only marks the debounce.
-  `poll` starts a backup task once the board is quiet, and restore is a task
-  too. A task runs in a fresh instance (`run_task`), so everything it needs
-  comes from `/storage`, `license::token` and its `input`. Restore never runs
-  over a board that has columns, checked both in the UI and in the task.
+- **Nothing slow runs on the calls from the app.** Every call has a 10-second
+  deadline. `persist` only marks the debounce. `poll` starts a backup task
+  once the board is quiet, and restore is a task too. A task runs on a thread
+  of its own (`PluginHost::spawn`), with only the board's folder on disk, the
+  token and its `input`. `poll` hands its result to
+  `ProjectManagementProvider::task_done`. Restore never runs over a board that
+  has columns, checked both in the UI and in the task.
 
 ## Environment (Nix)
 
 The toolchain comes from the flake dev shell in [flake.nix](flake.nix): Rust
-from rust-overlay with the `wasm32-wasip2` target (nixpkgs' rustc has no `std`
-for it), `wasm-tools` and `jq`. Nothing is installed system-wide.
+from rust-overlay with this computer's plugin target (static musl on Linux,
+which nixpkgs' rustc has no std for) and `jq`. Nothing is installed
+system-wide.
 
 - **Check once per session**, then stick with the answer: `command -v cargo`.
   - Non-empty: the shell is inside `nix develop`, so run `cargo ...` directly.
@@ -99,8 +107,8 @@ instead, or split into separate sentences.
 ## Testing
 
 - After implementing changes, always run the tests before finishing:
-  `cargo test` (natively), and `./scripts/release-plugin.sh --dry-run`, which
-  also builds the component and audits its imports.
+  `cargo test`, and `./scripts/release-plugin.sh --dry-run`, which also builds
+  this computer's release and verifies it the way the Store will.
 - When adding new code, write or update tests.
 - If tests fail, fix the code. Never leave a task with failing tests.
 
@@ -123,7 +131,11 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/projectmanagement.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK and the pdk come from crates.io, and `sicompass-payments` by git at the
-SDK's release tag (the source is all in `../sicompass-plugin-sdk`). The
+The SDK comes from crates.io, and `sicompass-payments` by git at the SDK's
+release tag (the source is all in `../sicompass-plugin-sdk`). The
 commented-out `[patch]` in `Cargo.toml` is for working on them together, and
 stays commented on main.
+
+A release has one archive per platform. The release workflow builds them on
+five runners (Linux x86_64 and arm64 as static musl, macOS arm64 and x86_64,
+Windows x86_64), then packs, signs and verifies them in one job.
