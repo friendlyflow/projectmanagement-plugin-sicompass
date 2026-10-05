@@ -66,8 +66,8 @@ surface. In short:
   and `reconcile_columns` skips it. The app hands back whatever it displayed,
   so without that the row becomes a column. It never links anywhere: buying
   and redeeming are in the Store, under tiers.
-- **Nothing slow runs on the calls from the app.** Every call has a 10-second
-  deadline. `persist` only marks the debounce. `poll` starts a backup task
+- **Nothing slow runs on the calls from the app.** The app waits for
+  every call to answer. `persist` only marks the debounce. `poll` starts a backup task
   once the board is quiet, and restore is a task too. A task runs on a thread
   of its own (`PluginHost::spawn`), with only the board's folder on disk, the
   token and its `input`. `poll` hands its result to
