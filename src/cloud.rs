@@ -1,21 +1,23 @@
-//! Cloud backup of the board, to Sicompass Cloud.
+//! Cloud sync of the board, through Sicompass Cloud.
 //!
-//! Off until the user ticks "enable cloud backup" in the board's settings. The
-//! service itself (the switch, uploads a while after the last change and
-//! restores, both as background tasks) is `sicompass_payments::cloud`, the
-//! same one a third party's plugin would use. What is here is what only the
-//! board knows: which service, the row above the columns, and the host: the
-//! app, through the plugin kit, plus threads of this process.
+//! Off until the user ticks "enable cloud sync" in the board's settings. The
+//! service itself (the switch, a sync a while after the last change, every
+//! minute and on demand, as background tasks, and the merge of what another
+//! computer changed) is `sicompass_sync::cloud`, the same one a third party's
+//! plugin would use. What is here is what only the board knows: which
+//! service, the row above the columns, and the host: the app, through the
+//! plugin kit, plus threads of this process.
 //!
 //! - **Where the user stands** comes from the app (`license::standing` for
 //!   Sicompass Cloud), which verified the certificate. The row says it, in the
 //!   user's language, and never links anywhere: buying and redeeming are in
 //!   store, tiers.
-//! - **An upload** is a task, on a thread of its own: it reads the board's
+//! - **A sync** is a task, on a thread of its own: it reads the board's
 //!   folder ([`storage_dir`]), gets the redeem token from `license::token`
-//!   (which the app gives only for this plugin's own service) and uploads
-//!   with [`net_send`]. Its result reaches the plugin through
-//!   [`CloudHost::finished`], which `poll` drains.
+//!   (which the app gives only for this plugin's own service) and talks to the
+//!   server with [`net_send`]. Its result reaches the plugin through
+//!   [`CloudHost::finished`], which `poll` drains. What it merged is written
+//!   back on the plugin's thread, and the board is read again.
 //!
 //! The paywall is on the service, never on the data: whatever the standing,
 //! the board is shown and saved to disk. Only the copy on the server is paid.
@@ -24,19 +26,19 @@ use std::cell::Cell;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use sicompass_payments::cloud::Service;
-pub use sicompass_payments::cloud::{Cloud, Finished, Host, TASK_BACKUP, TASK_RESTORE};
-use sicompass_payments::protocol::{Request, Response};
-use sicompass_payments::row::Standing;
 use sicompass_sdk::ffon::FfonElement;
 use sicompass_sdk::plugin::{TierStatus, host, license, storage_dir};
 use sicompass_sdk::tags;
+use sicompass_sync::cloud::Service;
+pub use sicompass_sync::cloud::{Cloud, Finished, Host, TASK_SYNC};
+use sicompass_sync::protocol::{Request, Response};
+use sicompass_sync::row::Standing;
 
 use crate::localize;
 
 /// Sicompass Cloud, for the board. `plugin.json` names the same tier as its
 /// `service` and allows only this server. The store is called "kanban" on the
-/// server because that is what it holds, and existing backups are under it.
+/// server because that is what it holds, and existing copies are under it.
 pub const SERVICE: Service = Service {
     tier: "friendlyflow/cloud",
     server: "https://store.sicompass.org",
@@ -45,10 +47,11 @@ pub const SERVICE: Service = Service {
     prefix: "projectmanagement",
 };
 
-/// The settings key of the "enable cloud backup" switch.
+/// The settings key of the "enable cloud sync" switch. It kept its name from
+/// when this was a backup, so the switch survives the update.
 pub const ENABLE_KEY: &str = "kanbanCloudBackup";
 
-/// The `<id>` the backup row carries, so it is never taken for a column
+/// The `<id>` the sync row carries, so it is never taken for a column
 /// (column and card ids are numbers).
 pub const ROW_ID: &str = "cloud";
 
@@ -74,7 +77,7 @@ pub fn row(cloud: &Cloud, host: &dyn Host) -> Option<FfonElement> {
     )))
 }
 
-/// Whether a row is the backup row (rendered, never stored).
+/// Whether a row is the sync row (rendered, never stored).
 pub fn is_row(raw: &str) -> bool {
     let prefix = raw.split("<input>").next().unwrap_or(raw);
     tags::extract_id(prefix).as_deref() == Some(ROW_ID)
@@ -89,9 +92,9 @@ pub fn translate(id: &str, args: &[(&str, String)]) -> String {
     localize::t_args(id, &a)
 }
 
-/// The backup's HTTP: `send` for [`sicompass_payments::protocol`], over a
+/// The sync's HTTP: `send` for [`sicompass_sync::protocol`], over a
 /// blocking client with rustls. Every status comes back as it is, because the
-/// protocol reads the server's refusals (a 404 is "no backup yet").
+/// protocol reads the server's refusals (a 409 is "another computer synced first").
 pub fn net_send(req: &Request) -> Result<Response, String> {
     use std::sync::OnceLock;
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
@@ -127,14 +130,14 @@ pub fn net_send(req: &Request) -> Result<Response, String> {
 /// How long one request may take, start to end. An upload is a few MB at most.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The most a reply may hold: a restored snapshot, with room for its encoding.
-const MAX_RESPONSE_BYTES: u64 = 4 * sicompass_payments::snapshot::MAX_SNAPSHOT_BYTES as u64;
+/// The most a reply may hold: a downloaded snapshot, with room for its encoding.
+const MAX_RESPONSE_BYTES: u64 = 4 * sicompass_sync::snapshot::MAX_SNAPSHOT_BYTES as u64;
 
 /// What a background task reported: its id and its outcome.
 pub type TaskResult = (u64, Result<Vec<u8>, String>);
 
 /// The host: the app, through the plugin kit, and threads of this process for
-/// the uploads and restores.
+/// the syncs.
 pub struct PluginHost {
     next_task: Cell<u64>,
     done_tx: mpsc::Sender<TaskResult>,
@@ -158,16 +161,12 @@ impl Default for PluginHost {
     }
 }
 
-/// A backup task, on a thread of its own. Everything it needs is the board's
-/// folder on disk, the redeem token and its `input`, the hash of the last
-/// upload.
-fn run_task(task: &str, input: &[u8], token: Option<String>) -> Result<Vec<u8>, String> {
+/// A sync task, on a thread of its own. Everything it needs is the board's
+/// folder on disk and the redeem token.
+fn run_task(task: &str, _input: &[u8], token: Option<String>) -> Result<Vec<u8>, String> {
     let root = storage_dir().ok_or("the board has no folder")?;
     match task {
-        TASK_BACKUP => {
-            sicompass_payments::cloud::run_backup(&SERVICE, &root, input, token, &net_send)
-        }
-        TASK_RESTORE => sicompass_payments::cloud::run_restore(&SERVICE, &root, token, &net_send),
+        TASK_SYNC => sicompass_sync::cloud::run_sync(&SERVICE, &root, token, &net_send),
         other => Err(format!("no task named `{other}`")),
     }
 }
@@ -285,7 +284,7 @@ mod tests {
     }
 
     /// The protocol reads the server's refusals itself, so an error status is
-    /// an answer, not a failure: a 404 on restore means "no backup yet".
+    /// an answer, not a failure: a 404 on a download means "nothing stored yet".
     #[test]
     fn net_send_hands_back_an_error_status_as_an_answer() {
         let (url, server) = one_shot_server(404, "");
@@ -324,8 +323,8 @@ mod tests {
     #[test]
     fn a_spawned_task_reports_back_through_finished() {
         let host = PluginHost::new();
-        let first = host.spawn(TASK_BACKUP, b"").unwrap();
-        let second = host.spawn(TASK_RESTORE, b"").unwrap();
+        let first = host.spawn(TASK_SYNC, b"").unwrap();
+        let second = host.spawn(TASK_SYNC, b"").unwrap();
         assert_ne!(first, second);
 
         let mut done = Vec::new();

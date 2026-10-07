@@ -3,7 +3,7 @@
 //! A sicompass plugin: a program sicompass starts (`src/main.rs`), with the
 //! user's rights. The board lives in the plugin's own folder (`"storage":
 //! true`, the same directory the built-in used, so nothing moves), and the
-//! optional cloud backup is in [`cloud`].
+//! optional cloud sync is in [`cloud`].
 //!
 //! # Two surfaces, one board
 //!
@@ -41,6 +41,19 @@
 //!
 //! There is no `unarchive` command, because the archive is a real column and
 //! `move left` already walks a card back out of it.
+//!
+//! # Every list opens with its list meta
+//!
+//! Like the notes plugin's, the first row of the columns list and of every
+//! column is a `list meta:` row (below the cloud row, at the top). Inside it:
+//! the Merkle hash of the board or of that column (`board.rs`), which changes
+//! when anything in it changes, and, while cloud sync is on, whether it is as
+//! it was at the last sync. It is rendered, never stored: `reconcile` skips
+//! it, it cannot be edited or deleted, and the board view, which draws from
+//! [`board::Board`] and not from these rows, never sees it. Being a row, it
+//! shifts every index the app counts in `fetch()` rows (the dashboard entry
+//! path and `SelectPath`), which [`ProjectManagementProvider::lead_rows`]
+//! accounts for.
 //!
 //! # Why a card is a `Str`
 //!
@@ -113,7 +126,7 @@ pub const CMD_MOVE_RIGHT: &str = "move right";
 /// `src/sicompass/src/list.rs`). Lowercase, like every other command id in the
 /// app.
 pub const CMD_ARCHIVE: &str = "archive card";
-pub const CMD_RESTORE_BACKUP: &str = "restore cloud backup";
+pub const CMD_SYNC_NOW: &str = "sync with the cloud now";
 
 // ---------------------------------------------------------------------------
 // Board operations, as they cross the timeline
@@ -239,8 +252,10 @@ struct EditState {
 pub struct ProjectManagementProvider {
     board: Board,
     /// The column the list cursor has descended into, if any. A board is two
-    /// levels deep, so this is the whole path.
+    /// levels deep, so this and `in_meta` are the whole path.
     open_column: Option<Id>,
+    /// Inside the list meta of the open column, or of the board at the top.
+    in_meta: bool,
     rendered_path: String,
     /// Displayed label back to the id it names, per level. `push_path` is handed
     /// the label the user was looking at, not an id.
@@ -256,8 +271,8 @@ pub struct ProjectManagementProvider {
     timeline: Vec<ProviderOp>,
     /// Text taken by `commit_edit` for a row the app has not told us about yet.
     pending_create: Option<String>,
-    /// Opt-in mirror of the board to Sicompass Cloud. Inert until the user
-    /// ticks "enable cloud backup" in the board's settings; see [`cloud`].
+    /// Opt-in sync of the board through Sicompass Cloud. Inert until the user
+    /// ticks "enable cloud sync" in the board's settings; see [`cloud`].
     cloud: Cloud,
     /// The host calls the cloud needs, injectable so the tests run natively.
     host: Box<dyn CloudHost>,
@@ -301,6 +316,7 @@ impl ProjectManagementProvider {
         ProjectManagementProvider {
             board: Board::new(),
             open_column: None,
+            in_meta: false,
             rendered_path: String::new(),
             labels: HashMap::new(),
             root_override: None,
@@ -350,7 +366,7 @@ impl ProjectManagementProvider {
     }
 
     pub fn at_root(&self) -> bool {
-        self.open_column.is_none()
+        self.open_column.is_none() && !self.in_meta
     }
 
     pub fn needs_refresh(&self) -> bool {
@@ -364,7 +380,7 @@ impl ProjectManagementProvider {
 
     pub fn take_error(&mut self) -> Option<String> {
         // The board's own error leads: a board that could not be saved matters
-        // more than a backup that could not be uploaded.
+        // more than a sync that could not run.
         self.error.take().or_else(|| self.cloud.take_error())
     }
 
@@ -435,20 +451,7 @@ impl ProjectManagementProvider {
                 self.error = Some(localize::t("projectmanagement-error-unreadable"));
             }
         }
-    }
-
-    /// Pull the cloud backup back over an empty board.
-    ///
-    /// A background task. Its outcome is spoken when it ends
-    /// ([`ProjectManagementProvider::task_done`]): "nothing was restored" and "restored" both
-    /// need saying, and only one of them is an error. A board with columns is
-    /// refused here already, before anything reaches the network.
-    fn restore_cloud_backup(&mut self) {
-        if !self.board.columns.is_empty() || self.load_failed {
-            self.cloud.refuse_restore(&*self.host);
-            return;
-        }
-        self.cloud.start_restore(&*self.host);
+        self.cloud.load_base(&root);
     }
 
     fn persist(&mut self) {
@@ -460,10 +463,10 @@ impl ProjectManagementProvider {
         };
         if store::save_board(&root, &self.board).is_err() {
             self.error = Some(localize::t("projectmanagement-error-save"));
-            // The disk write failed, so there is no new state worth mirroring.
+            // The disk write failed, so there is no new state worth syncing.
             return;
         }
-        // Queues only. Every board edit lands here, so the upload itself is a
+        // Queues only. Every board edit lands here, so the sync itself is a
         // background task, started from `poll` once the board is quiet.
         self.cloud.mark_dirty(&*self.host);
     }
@@ -485,8 +488,54 @@ impl ProjectManagementProvider {
         entry.insert(tags::strip_display(label), id);
     }
 
+    // ---- The list meta ----------------------------------------------------
+
+    /// The `list meta:` row's text.
+    ///
+    /// Localized, and therefore never literally `"meta"`: the app special-cases
+    /// an Obj keyed exactly `"meta"` and skips `pop_path` when leaving it,
+    /// which would leave this provider's path one segment deeper than the
+    /// cursor.
+    fn meta_label() -> String {
+        localize::t("projectmanagement-list-meta")
+    }
+
+    /// Rows the app shows above the board's own in the list the cursor is on:
+    /// the cloud row (columns list, sync on) and the list meta. Every index the
+    /// app counts in `fetch()` rows is off by this much from a position in
+    /// [`Board::columns`] or a column's cards.
+    fn lead_rows(&self, columns_list: bool) -> usize {
+        1 + usize::from(columns_list && self.cloud.is_enabled())
+    }
+
+    /// Inside the list meta: the Merkle hash of the board (at the top) or of
+    /// the open column, and, with cloud sync on, whether that is still what
+    /// the last sync agreed on.
+    fn meta_children(&self) -> Vec<FfonElement> {
+        let (id, hash) = match self.open_column.and_then(|c| self.board.column(c)) {
+            Some(c) => (Some(c.id), c.hash_hex()),
+            None => (None, self.board.root_hash_hex()),
+        };
+        let status = self.cloud.sync_status(id, &hash, &*self.host);
+        let mut args = localize::Args::new();
+        args.set("hash", hash);
+        let mut out = vec![FfonElement::new_str(localize::t_args(
+            "projectmanagement-sha256",
+            &args,
+        ))];
+        if let Some(line) = status {
+            out.push(FfonElement::new_str(line));
+        }
+        out
+    }
+
     /// The rows for the level the cursor is on.
     fn level_children(&mut self) -> Vec<FfonElement> {
+        // Before forgetting the level's labels: inside the meta the level is
+        // still the open column's, and its rows are wanted again on the way out.
+        if self.in_meta {
+            return self.meta_children();
+        }
         let level = self.open_column;
         self.labels.remove(&level);
 
@@ -519,6 +568,8 @@ impl ProjectManagementProvider {
         {
             out.push(row);
         }
+        // Every list opens with its meta, the columns list included.
+        out.push(FfonElement::new_obj(Self::meta_label()));
         for (id, text, is_column) in rows {
             let label = Self::row_label(id, &text);
             self.remember(level, &label, id);
@@ -546,9 +597,14 @@ impl ProjectManagementProvider {
     }
 
     fn sync_rendered_path(&mut self) {
-        self.rendered_path = match self.open_column {
+        let column = match self.open_column {
             None => String::new(),
             Some(id) => format!("/c{id}"),
+        };
+        self.rendered_path = if self.in_meta {
+            format!("{column}/m")
+        } else {
+            column
         };
     }
 
@@ -571,6 +627,7 @@ impl ProjectManagementProvider {
         let rendered_only = [
             localize::t("projectmanagement-empty-columns"),
             localize::t("projectmanagement-empty-cards"),
+            Self::meta_label(),
         ];
 
         // Which list is this? Not necessarily the one the cursor is on: undo and
@@ -1440,6 +1497,7 @@ impl ProjectManagementProvider {
             // Dashboard is drained and dropped, never deferred, and the board
             // owns its own cursor anyway.
             if let Some(at) = self.board.column_index(from_column) {
+                let at = at + self.lead_rows(true);
                 self.navigation = Some(NavigationRequest::SelectPath(vec![at as u32]));
             }
         }
@@ -1515,7 +1573,7 @@ impl Plugin for ProjectManagementProvider {
         }
     }
 
-    /// Pick up the backup switch as the user left it, quietly: the "needs a
+    /// Pick up the sync switch as the user left it, quietly: the "needs a
     /// subscription" notice is for the moment they switch it on.
     fn init(&mut self) {
         let on = sicompass_sdk::plugin::host::get_setting(cloud::ENABLE_KEY);
@@ -1527,8 +1585,8 @@ impl Plugin for ProjectManagementProvider {
         self.level_children()
     }
 
-    /// Every frame: start a backup once the board has been quiet long enough,
-    /// and hand over whatever needs saying or doing.
+    /// Every frame: start a sync once one is due, and hand over whatever
+    /// needs saying or doing.
     fn poll(&mut self) -> PollResult {
         for (id, result) in self.host.finished() {
             self.task_done(id, result);
@@ -1552,12 +1610,20 @@ impl Plugin for ProjectManagementProvider {
 
     fn sync_ffon_body_children(&mut self, children: &[FfonElement]) {
         self.ensure_loaded();
+        // The meta level holds rendered lines, not cards.
+        if self.in_meta {
+            return;
+        }
         self.reconcile(children);
     }
 
-    fn commit_edit(&mut self, _old: &str, new: &str) -> bool {
+    fn commit_edit(&mut self, old: &str, new: &str) -> bool {
         if self.load_failed {
             self.error = Some(localize::t("projectmanagement-error-unreadable"));
+            return false;
+        }
+        if old == Self::meta_label() {
+            self.error = Some(localize::t("projectmanagement-error-meta-readonly"));
             return false;
         }
         // Remembered rather than applied: the app has not yet handed back the
@@ -1574,7 +1640,11 @@ impl Plugin for ProjectManagementProvider {
             self.error = Some(localize::t("projectmanagement-error-unreadable"));
             return false;
         }
-        // The backup row is the switch's, in settings, not a column.
+        if name == Self::meta_label() {
+            self.error = Some(localize::t("projectmanagement-error-meta-undeletable"));
+            return false;
+        }
+        // The sync row is the switch's, in settings, not a column.
         if cloud::is_row(name) {
             self.error = Some(localize::t("projectmanagement-error-cloud-row-undeletable"));
             return false;
@@ -1583,18 +1653,34 @@ impl Plugin for ProjectManagementProvider {
     }
 
     fn push_path(&mut self, segment: &str) {
+        // The meta holds lines, nothing to descend into.
+        if self.in_meta {
+            return;
+        }
+        // Its own label first: no column can carry it, because every
+        // translation ends in a colon and `column_title` strips one.
+        if segment == Self::meta_label() {
+            self.in_meta = true;
+            self.sync_rendered_path();
+            return;
+        }
+        let column = if self.open_column.is_none() {
+            self.labels.get(&None).and_then(|m| m.get(segment)).copied()
+        } else {
+            None
+        };
+        if column.is_none() && segment == "m" {
+            self.in_meta = true;
+            self.sync_rendered_path();
+            return;
+        }
         // Cards are leaves, so only the root level descends. Without this guard a
         // stale label from the card level could push a second segment and leave
         // the provider a level deeper than the cursor.
         if self.open_column.is_some() {
             return;
         }
-        let resolved = self
-            .labels
-            .get(&None)
-            .and_then(|m| m.get(segment))
-            .copied()
-            .or_else(|| segment.strip_prefix("c").and_then(|s| s.parse().ok()));
+        let resolved = column.or_else(|| segment.strip_prefix("c").and_then(|s| s.parse().ok()));
         if let Some(id) = resolved {
             self.open_column = Some(id);
             self.sync_rendered_path();
@@ -1602,7 +1688,11 @@ impl Plugin for ProjectManagementProvider {
     }
 
     fn pop_path(&mut self) {
-        self.open_column = None;
+        if self.in_meta {
+            self.in_meta = false;
+        } else {
+            self.open_column = None;
+        }
         self.sync_rendered_path();
     }
 
@@ -1620,9 +1710,25 @@ impl Plugin for ProjectManagementProvider {
     /// over the column's listing and the cursor fell to its first row. Labels
     /// resolve the same way [`Self::push_path`] resolves them.
     fn set_current_path(&mut self, path: &str) {
-        let seg = path.trim_start_matches('/');
+        let mut seg = path.trim_start_matches('/');
+        // A trailing list meta, as its token (`/c3/m`) or its label.
+        let meta_label = Self::meta_label();
+        let mut in_meta = false;
+        for meta in ["m", meta_label.as_str()] {
+            if seg == meta {
+                seg = "";
+                in_meta = true;
+                break;
+            }
+            if let Some(rest) = seg.strip_suffix(meta).and_then(|r| r.strip_suffix('/')) {
+                seg = rest;
+                in_meta = true;
+                break;
+            }
+        }
         if seg.is_empty() {
             self.open_column = None;
+            self.in_meta = in_meta;
             self.sync_rendered_path();
             return;
         }
@@ -1639,6 +1745,7 @@ impl Plugin for ProjectManagementProvider {
             .or_else(|| seg.strip_prefix('c').and_then(|s| s.parse().ok()));
         if let Some(id) = resolved {
             self.open_column = Some(id);
+            self.in_meta = in_meta;
             self.sync_rendered_path();
         }
     }
@@ -1647,7 +1754,9 @@ impl Plugin for ProjectManagementProvider {
     /// that list. Without this the app falls back to rebuilding the provider
     /// root, which misroutes a descended path and leaves the level empty.
     fn fetch_subtree_children(&mut self) -> Option<Vec<FfonElement>> {
-        self.open_column?;
+        if self.open_column.is_none() && !self.in_meta {
+            return None;
+        }
         self.ensure_loaded();
         Some(self.level_children())
     }
@@ -1662,6 +1771,9 @@ impl Plugin for ProjectManagementProvider {
     /// text, and no column is titled `c3`, so without this the descent stopped
     /// at the root and the tab reopened with the column closed.
     fn fetch_subtree_parent_key(&mut self) -> Option<String> {
+        if self.in_meta {
+            return Some(Self::meta_label());
+        }
         let col = self.open_column?;
         self.ensure_loaded();
         self.board
@@ -1669,7 +1781,7 @@ impl Plugin for ProjectManagementProvider {
             .map(|c| Self::row_label(c.id, &c.title))
     }
 
-    /// The backup switch. The host passes on only this plugin's own settings.
+    /// The sync switch. The host passes on only this plugin's own settings.
     fn on_setting_change(&mut self, key: &str, value: &str) {
         self.cloud.on_setting_change(key, value, &*self.host);
     }
@@ -1714,10 +1826,10 @@ impl Plugin for ProjectManagementProvider {
             CMD_MOVE_RIGHT.to_owned(),
             CMD_ARCHIVE.to_owned(),
         ];
-        // Offered only when cloud backup is on: restoring is meaningless
-        // otherwise, and an inert command in the palette is noise.
+        // Offered only when cloud sync is on: an inert command in the
+        // palette is noise.
         if self.cloud.is_enabled() {
-            out.push(CMD_RESTORE_BACKUP.to_owned());
+            out.push(CMD_SYNC_NOW.to_owned());
         }
         out
     }
@@ -1729,7 +1841,7 @@ impl Plugin for ProjectManagementProvider {
             CMD_MOVE_LEFT => localize::t("projectmanagement-cmd-move-left"),
             CMD_MOVE_RIGHT => localize::t("projectmanagement-cmd-move-right"),
             CMD_ARCHIVE => localize::t("projectmanagement-cmd-archive-card"),
-            CMD_RESTORE_BACKUP => localize::t("projectmanagement-cmd-restore-backup"),
+            CMD_SYNC_NOW => localize::t("projectmanagement-cmd-sync-now"),
             other => other.to_owned(),
         }
     }
@@ -1750,8 +1862,8 @@ impl Plugin for ProjectManagementProvider {
             self.archive_card(elem_key);
             return Ok(None);
         }
-        if cmd == CMD_RESTORE_BACKUP {
-            self.restore_cloud_backup();
+        if cmd == CMD_SYNC_NOW {
+            self.cloud.start_sync(&*self.host);
             return Ok(None);
         }
         let ok = match cmd {
@@ -1788,13 +1900,21 @@ impl Plugin for ProjectManagementProvider {
         // `push_path`.
         //
         // A title has no card index, so the board opens on that column's first
-        // card. Anything else is left where it was.
+        // card. Anything else is left where it was, and so is a row above the
+        // columns (the cloud row, the list meta): the indices are the app's,
+        // counted in `fetch()` rows, and those rows are not on the board.
+        let lead = self.lead_rows(true);
         match std::mem::take(&mut self.entry_path).as_slice() {
-            [col] => self.focus = Focus { col: *col, row: 0 },
-            [col, card, ..] => {
+            [col] if *col >= lead => {
                 self.focus = Focus {
-                    col: *col,
-                    row: *card,
+                    col: col - lead,
+                    row: 0,
+                }
+            }
+            [col, card, ..] if *col >= lead => {
+                self.focus = Focus {
+                    col: col - lead,
+                    row: card.saturating_sub(self.lead_rows(false)),
                 }
             }
             _ => {}
@@ -1823,8 +1943,8 @@ impl Plugin for ProjectManagementProvider {
         // row itself is as close as the list can get.
         if !self.on_placeholder() && self.board.columns.get(self.focus.col).is_some() {
             self.navigation = Some(NavigationRequest::SelectPath(vec![
-                self.focus.col as u32,
-                self.focus.row as u32,
+                (self.focus.col + self.lead_rows(true)) as u32,
+                (self.focus.row + self.lead_rows(false)) as u32,
             ]));
         }
     }
@@ -2020,12 +2140,24 @@ impl ProjectManagementProvider {
 impl ProjectManagementProvider {
     /// A background task ([`cloud::PluginHost`] runs them on threads) ended.
     /// `poll` hands each one over, in the order they finished.
+    ///
+    /// A sync that merged another computer's board in writes it to disk here,
+    /// and the board is read again. Nothing was saved since the sync started
+    /// (the cloud checks), so nothing typed here is lost.
     pub fn task_done(&mut self, id: u64, result: Result<Vec<u8>, String>) {
-        if self.cloud.on_task_done(id, result, &*self.host) == Finished::Restored {
-            // The board in memory is stale: re-read what the task wrote.
+        let Some(root) = self.root() else {
+            return;
+        };
+        if self.cloud.on_task_done(id, result, &*self.host, &root) == Finished::Reload {
+            // The board in memory is stale: re-read what the sync wrote. The
+            // counter stays above every id this session handed out, which the
+            // undo timeline may still hold.
+            let floor = self.board.next_id();
             self.loaded = false;
             self.load_failed = false;
             self.ensure_loaded();
+            self.board.raise_counter(floor);
+            self.clamp_focus();
             self.refresh = true;
         }
     }
@@ -2064,7 +2196,7 @@ fn to_sdk_palette(p: sicompass_sdk::plugin::Palette) -> sicompass_sdk::Dashboard
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sicompass_payments::row::Standing;
+    use sicompass_sync::row::Standing;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use tempfile::TempDir;
@@ -2246,11 +2378,14 @@ mod tests {
     #[test]
     fn the_root_lists_the_columns_and_a_column_lists_its_cards() {
         let mut p = seeded();
-        assert_eq!(labels(&p.fetch()), vec!["To do", "Doing"]);
+        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do", "Doing"]);
         p.push_path("To do");
-        assert_eq!(labels(&p.fetch()), vec!["fix login", "write docs"]);
+        assert_eq!(
+            labels(&p.fetch()),
+            vec![meta().as_str(), "fix login", "write docs"]
+        );
         p.pop_path();
-        assert_eq!(labels(&p.fetch()), vec!["To do", "Doing"]);
+        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do", "Doing"]);
     }
 
     #[test]
@@ -2260,7 +2395,9 @@ mod tests {
         let mut p = seeded();
         assert!(p.fetch().iter().all(|e| e.is_obj()), "columns must be Obj");
         p.push_path("To do");
-        assert!(p.fetch().iter().all(|e| e.is_str()), "cards must be Str");
+        let rows = p.fetch();
+        assert!(matches!(&rows[0], FfonElement::Obj(o) if o.key == meta()));
+        assert!(rows[1..].iter().all(|e| e.is_str()), "cards must be Str");
     }
 
     #[test]
@@ -2276,8 +2413,8 @@ mod tests {
     fn an_empty_level_renders_a_placeholder_rather_than_nothing() {
         let mut p = ProjectManagementProvider::new();
         p.loaded = true;
-        assert_eq!(p.fetch().len(), 1);
-        assert!(labels(&p.fetch())[0].contains("no columns"));
+        assert_eq!(p.fetch().len(), 2);
+        assert!(labels(&p.fetch())[1].contains("no columns"));
     }
 
     #[test]
@@ -2310,7 +2447,7 @@ mod tests {
         let mut p = seeded();
         descend(&mut p, "To do");
         let mut rows = p.fetch();
-        rows.remove(0);
+        rows.remove(1); // row 0 is the list meta
         p.sync_ffon_body_children(&rows);
         assert_eq!(cards(&p, 0), vec!["write docs"]);
     }
@@ -2341,7 +2478,7 @@ mod tests {
         let mut p = provider(&dir);
         p.ensure_loaded();
         assert_eq!(p.board.columns[0].title, "To do");
-        assert_eq!(labels(&p.fetch()), vec!["To do"]);
+        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do"]);
     }
 
     #[test]
@@ -2416,10 +2553,10 @@ mod tests {
         descend(&mut p, "To do");
         let rows = p.fetch();
         assert!(
-            !tags::has_button(raw_of(&rows[0])),
+            !tags::has_button(raw_of(&rows[1])),
             "a card must not forge a button"
         );
-        assert_eq!(labels(&rows)[0], "<button>submit</button>Send");
+        assert_eq!(labels(&rows)[1], "<button>submit</button>Send");
     }
 
     #[test]
@@ -2457,7 +2594,7 @@ mod tests {
             p.sync_ffon_body_children(&rows);
         }
         let mut p = provider(&dir);
-        assert_eq!(labels(&p.fetch()), vec!["To do"]);
+        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do"]);
     }
 
     #[test]
@@ -2467,7 +2604,7 @@ mod tests {
         let saved = p.current_path().to_owned();
         let mut fresh = seeded();
         fresh.set_current_path(&saved);
-        assert_eq!(labels(&fresh.fetch()), vec!["kanban ui"]);
+        assert_eq!(labels(&fresh.fetch()), vec![meta().as_str(), "kanban ui"]);
     }
 
     /// The app also builds a path out of the display text of the row the cursor
@@ -2486,7 +2623,7 @@ mod tests {
         let _ = q.fetch();
         q.set_current_path("/Doing");
         assert_eq!(q.current_path(), walked);
-        assert_eq!(labels(&q.fetch()), vec!["kanban ui"]);
+        assert_eq!(labels(&q.fetch()), vec![meta().as_str(), "kanban ui"]);
     }
 
     /// A column may be titled `c1`, and on a path this provider rendered itself
@@ -2498,7 +2635,11 @@ mod tests {
         let _ = p.fetch();
 
         p.set_current_path("/c4");
-        assert_eq!(labels(&p.fetch()), vec!["kanban ui"], "column 4 is `Doing`");
+        assert_eq!(
+            labels(&p.fetch()),
+            vec![meta().as_str(), "kanban ui"],
+            "column 4 is `Doing`"
+        );
     }
 
     #[test]
@@ -2507,7 +2648,7 @@ mod tests {
         descend(&mut p, "Doing");
         p.set_current_path("/");
         assert!(p.at_root());
-        assert_eq!(labels(&p.fetch()), vec!["To do", "Doing"]);
+        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do", "Doing"]);
     }
 
     /// Staying put beats falling back to the board root, which is the one place
@@ -2603,8 +2744,9 @@ mod tests {
     fn the_board_opens_on_the_card_the_list_cursor_was_on() {
         let mut p = seeded();
         descend(&mut p, "To do");
-        // The cursor is on the second card of the first column.
-        p.set_dashboard_entry(&[0, 1]);
+        // The cursor is on the second card of the first column (each list
+        // opens with its meta row, so these are `fetch()` rows 1 and 2).
+        p.set_dashboard_entry(&[1, 2]);
         p.enter_dashboard();
         assert_eq!(p.focus, Focus { col: 0, row: 1 });
     }
@@ -2612,8 +2754,9 @@ mod tests {
     #[test]
     fn from_a_column_title_the_board_opens_on_that_columns_first_card() {
         let mut p = seeded();
-        // The cursor is on the second column's title, at the provider root.
-        p.set_dashboard_entry(&[1]);
+        // The cursor is on the second column's title, at the provider root,
+        // below the list meta.
+        p.set_dashboard_entry(&[2]);
         p.enter_dashboard();
         assert_eq!(p.focus, Focus { col: 1, row: 0 });
     }
@@ -2623,11 +2766,11 @@ mod tests {
         // Whatever the board was showing is where the list lands, and whatever
         // the list was on is where the board opens.
         let mut p = seeded();
-        p.set_dashboard_entry(&[0, 1]);
+        p.set_dashboard_entry(&[1, 2]);
         p.enter_dashboard();
         assert_eq!(p.focus, Focus { col: 0, row: 1 });
         p.leave_dashboard();
-        assert_eq!(nav(&mut p), Some(vec![0, 1]));
+        assert_eq!(nav(&mut p), Some(vec![1, 2]));
     }
 
     #[test]
@@ -3146,7 +3289,7 @@ mod tests {
         let mut p = seeded();
         descend(&mut p, "To do");
         let rows = p.fetch();
-        let key_label = raw_of(&rows[0]).to_owned();
+        let key_label = raw_of(&rows[1]).to_owned();
         let before = p.board.clone();
         assert!(p.move_card_sideways(true, &key_label));
         let after = p.board.clone();
@@ -3241,7 +3384,7 @@ mod tests {
 
         let mut fresh = provider(&dir);
         descend(&mut fresh, "To do");
-        assert_eq!(labels(&fresh.fetch()), vec!["ship it"]);
+        assert_eq!(labels(&fresh.fetch()), vec![meta().as_str(), "ship it"]);
     }
 
     #[test]
@@ -3250,7 +3393,7 @@ mod tests {
         p.enter_dashboard();
         p.focus = Focus { col: 1, row: 0 };
         p.leave_dashboard();
-        assert_eq!(nav(&mut p), Some(vec![1, 0]));
+        assert_eq!(nav(&mut p), Some(vec![2, 1]));
         assert_eq!(nav(&mut p), None, "two-call semantics");
     }
 
@@ -3274,7 +3417,7 @@ mod tests {
         p.dashboard_text("half typed");
         p.leave_dashboard();
         assert_eq!(cards(&p, 0)[1], "half typed", "leaving is not a cancel");
-        assert_eq!(nav(&mut p), Some(vec![0, 1]));
+        assert_eq!(nav(&mut p), Some(vec![1, 2]));
     }
 
     #[test]
@@ -3341,7 +3484,7 @@ mod tests {
         assert!(labels(&p.fetch()).iter().any(|l| l == "Archive"));
 
         descend(&mut p, "Archive");
-        assert_eq!(labels(&p.fetch()), vec!["fix login"]);
+        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "fix login"]);
     }
 
     #[test]
@@ -3376,7 +3519,7 @@ mod tests {
         archive(&mut p, &key);
         assert_eq!(
             nav(&mut p),
-            Some(vec![0]),
+            Some(vec![1]),
             "without this the app unwinds the cursor to the board root"
         );
     }
@@ -3573,8 +3716,8 @@ mod tests {
         p.leave_dashboard();
         p.pop_path();
         let rows = p.fetch();
-        let doing = raw_of(&rows[1]).to_owned();
-        let arch = raw_of(&rows[2]).to_owned();
+        let doing = raw_of(&rows[2]).to_owned();
+        let arch = raw_of(&rows[3]).to_owned();
         assert!(!p.move_row_in_list(true, &doing), "down past the archive");
         assert!(!p.move_row_in_list(false, &arch), "and the archive itself");
         assert_eq!(
@@ -3701,7 +3844,7 @@ mod tests {
     /// prefix. A missing one would show as its id.
     #[test]
     fn every_cloud_message_resolves() {
-        for id in sicompass_payments::cloud::MESSAGES {
+        for id in sicompass_sync::cloud::MESSAGES {
             let id = format!("projectmanagement-{id}");
             assert_ne!(localize::t(&id), id);
         }
@@ -3764,9 +3907,9 @@ mod tests {
         p.on_setting_change(cloud::ENABLE_KEY, "true");
 
         let shown = labels(&p.fetch());
-        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert_eq!(shown.len(), 3, "{shown:?}");
         assert_eq!(
-            shown[1],
+            shown[2],
             localize::t("projectmanagement-empty-columns"),
             "{shown:?}"
         );
@@ -3809,93 +3952,148 @@ mod tests {
     }
 
     #[test]
-    fn the_restore_command_is_offered_only_with_backup_on() {
+    fn the_sync_command_is_offered_only_with_sync_on() {
         let p = seeded();
-        assert!(!p.commands().contains(&CMD_RESTORE_BACKUP.to_owned()));
+        assert!(!p.commands().contains(&CMD_SYNC_NOW.to_owned()));
         let p = seeded_with_cloud(active_licence());
-        assert!(p.commands().contains(&CMD_RESTORE_BACKUP.to_owned()));
+        assert!(p.commands().contains(&CMD_SYNC_NOW.to_owned()));
     }
 
-    /// Restoring must never run over a board that already has columns.
     #[test]
-    fn restore_refuses_to_overwrite_an_existing_board() {
+    fn sync_now_starts_a_sync_at_once() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = provider_on(&dir, &host);
         p.on_setting_change(cloud::ENABLE_KEY, "true");
-        p.ensure_loaded();
-        p.board.columns.push(Column::new(1, "To do"));
-        p.persist();
-
-        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
-
-        assert!(p.take_error().is_some(), "the refusal has to be reported");
-        assert!(
-            !host.spawned().iter().any(|(t, _)| t == cloud::TASK_RESTORE),
-            "refused before anything reaches the network"
+        p.handle_command(CMD_SYNC_NOW, "", 0).unwrap();
+        assert_eq!(
+            host.spawned(),
+            vec![(cloud::TASK_SYNC.to_owned(), Vec::new())]
         );
-        assert_eq!(p.board.columns.len(), 1);
-        assert_eq!(p.board.columns[0].title, "To do");
     }
 
-    /// Over an empty board the restore is a task; when it has written the
-    /// server's copy, the board is read again and the outcome is spoken.
+    /// What a finished sync reports, as the task hands it back.
+    fn outcome(o: &sicompass_sync::sync::Outcome) -> Result<Vec<u8>, String> {
+        Ok(serde_json::to_vec(o).unwrap())
+    }
+
+    /// The board another computer would have, as a sync hands it over.
+    fn merged_board(columns: &[&str]) -> sicompass_sync::sync::Outcome {
+        let elsewhere = TempDir::new().unwrap();
+        let mut other = provider(&elsewhere);
+        other.ensure_loaded();
+        for (i, title) in columns.iter().enumerate() {
+            other.board.columns.push(Column::new(i as Id + 1, *title));
+        }
+        other.persist();
+        let files = sicompass_sync::snapshot::read_store(&elsewhere.path().join("board"), "kanban")
+            .unwrap()
+            .files;
+        sicompass_sync::sync::Outcome::Apply {
+            files,
+            hash: "h-merged".to_owned(),
+            updated_at: Some(1),
+            conflicts: 0,
+        }
+    }
+
+    /// What a sync merged in is written, the board is read again, and that is
+    /// said. On a new computer this is how the board comes back.
     #[test]
-    fn a_finished_restore_reloads_the_board() {
+    fn a_merge_from_another_computer_reloads_the_board() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = provider_on(&dir, &host);
         p.on_setting_change(cloud::ENABLE_KEY, "true");
         p.fetch();
-        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
+        p.take_announcement();
+        p.poll();
         assert_eq!(
             host.spawned(),
-            vec![(cloud::TASK_RESTORE.to_owned(), Vec::new())]
+            vec![(cloud::TASK_SYNC.to_owned(), Vec::new())]
         );
 
-        // What the task wrote, from its own thread.
-        let mut elsewhere = provider(&dir);
-        elsewhere.ensure_loaded();
-        elsewhere
-            .board
-            .columns
-            .push(Column::new(1, "From the cloud"));
-        elsewhere.persist();
-
-        p.task_done(1, Ok(b"restored".to_vec()));
+        p.task_done(1, outcome(&merged_board(&["From the cloud"])));
         let poll = p.poll();
         assert!(poll.needs_refresh);
-        assert!(poll.announcement.is_some_and(|a| a.contains("restored")));
+        assert_eq!(
+            poll.announcement,
+            Some(localize::t("projectmanagement-sync-pulled"))
+        );
         assert!(labels(&p.fetch()).contains(&"From the cloud".to_owned()));
     }
 
-    /// An upload waits until the board has been quiet, then runs as a task.
+    /// A merge computed before the user typed must not land over what they
+    /// typed: it is dropped, and the next sync merges again, edit included.
     #[test]
-    fn a_backup_starts_once_the_board_is_quiet() {
+    fn a_merge_does_not_overwrite_an_edit_made_meanwhile() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = provider_on(&dir, &host);
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
+        p.fetch();
+        p.poll();
+        p.board.columns.push(Column::new(1, "Typed here"));
+        p.persist();
+
+        p.task_done(1, outcome(&merged_board(&["From the cloud"])));
+        let shown = labels(&p.fetch());
+        assert!(shown.contains(&"Typed here".to_owned()), "{shown:?}");
+        assert!(!shown.contains(&"From the cloud".to_owned()), "{shown:?}");
+    }
+
+    /// Ids handed out before a merge stay handed out: the undo timeline may
+    /// still hold one for a deleted card.
+    #[test]
+    fn the_counter_stays_above_ids_handed_out_before_a_merge() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = provider_on(&dir, &host);
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
+        p.ensure_loaded();
+        for _ in 0..5 {
+            let id = p.board.mint_id();
+            p.board.columns.push(Column::new(id, format!("c{id}")));
+        }
+        p.persist();
+        p.poll();
+        let floor = p.board.next_id();
+        p.task_done(1, outcome(&merged_board(&["x"])));
+        assert_eq!(p.board.columns.len(), 1, "the merge landed");
+        assert!(p.board.next_id() >= floor);
+    }
+
+    /// A sync runs at start-up, to pick up what another computer changed,
+    /// then a while after the board goes quiet, never on the UI.
+    #[test]
+    fn a_sync_runs_at_start_up_and_once_the_board_is_quiet() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(Standing::Grace { days_left: 2 });
         let mut p = provider_on(&dir, &host);
         p.on_setting_change(cloud::ENABLE_KEY, "true");
-        p.ensure_loaded();
-        p.board.columns.push(Column::new(1, "To do"));
-        p.persist();
-
-        host.advance(1_000);
-        p.poll();
-        assert!(host.spawned().is_empty(), "still arranging");
-
-        host.advance(sicompass_payments::debounce::DEBOUNCE_MS);
         assert!(p.poll().is_busy);
         assert_eq!(
             host.spawned(),
-            vec![(cloud::TASK_BACKUP.to_owned(), Vec::new())]
+            vec![(cloud::TASK_SYNC.to_owned(), Vec::new())]
         );
+        p.task_done(1, outcome(&sicompass_sync::sync::Outcome::UpToDate));
+
+        p.ensure_loaded();
+        p.board.columns.push(Column::new(1, "To do"));
+        p.persist();
+        host.advance(1_000);
+        p.poll();
+        assert_eq!(host.spawned().len(), 1, "still arranging");
+
+        host.advance(sicompass_sync::debounce::DEBOUNCE_MS);
+        assert!(p.poll().is_busy);
+        assert_eq!(host.spawned().len(), 2);
     }
 
     /// The paywall is on the service: without a subscription the board is
-    /// still saved, and only the upload does not happen.
+    /// still saved, and only the sync does not happen.
     #[test]
-    fn nothing_is_uploaded_without_a_subscription() {
+    fn nothing_is_synced_without_a_subscription() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(Standing::Expired { days_ago: 30 });
         let mut p = provider_on(&dir, &host);
@@ -3903,7 +4101,7 @@ mod tests {
         p.ensure_loaded();
         p.board.columns.push(Column::new(1, "To do"));
         p.persist();
-        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        host.advance(sicompass_sync::debounce::DEBOUNCE_MS + 1);
         p.poll();
         assert!(host.spawned().is_empty());
         assert!(store::load_board(&dir.path().join("board")).is_some_and(|b| b.columns.len() == 1));
@@ -3924,7 +4122,7 @@ mod tests {
         p.leave_dashboard();
         assert!(matches!(
             p.poll().navigation_request,
-            Some(NavigationRequest::SelectPath(ref at)) if at == &[0, 0]
+            Some(NavigationRequest::SelectPath(ref at)) if at == &[1, 1]
         ));
     }
 
@@ -3945,6 +4143,235 @@ mod tests {
         );
         assert_eq!(theirs.cursor, ours.cursor);
         assert_eq!(theirs.half_gap_rows, ours.half_gap_rows);
+    }
+
+    // ---- The list meta --------------------------------------------------
+
+    fn meta() -> String {
+        localize::t("projectmanagement-list-meta")
+    }
+
+    /// Into the list meta of the level the cursor is on, as the app goes:
+    /// render, then push the label.
+    fn enter_meta(p: &mut ProjectManagementProvider) -> Vec<String> {
+        let _ = p.fetch();
+        p.push_path(&meta());
+        labels(&p.fetch())
+    }
+
+    #[test]
+    fn every_list_opens_with_its_list_meta() {
+        let mut p = seeded();
+        let root = p.fetch();
+        assert!(matches!(&root[0], FfonElement::Obj(o) if o.key == meta()));
+        descend(&mut p, "To do");
+        let cards = p.fetch();
+        assert!(matches!(&cards[0], FfonElement::Obj(o) if o.key == meta()));
+        assert!(cards[1..].iter().all(|e| e.is_str()), "cards stay Str");
+    }
+
+    #[test]
+    fn with_sync_on_the_meta_comes_right_below_the_cloud_row() {
+        let mut p = seeded_with_cloud(active_licence());
+        let rows = p.fetch();
+        assert!(cloud::is_row(raw_of(&rows[0])));
+        assert_eq!(raw_of(&rows[1]), meta());
+    }
+
+    /// The board's root hash at the top, a column's own hash inside it: one
+    /// glance says whether anything below has changed.
+    #[test]
+    fn the_meta_shows_the_board_hash_at_the_top_and_the_column_hash_inside() {
+        let mut p = seeded();
+        let top = enter_meta(&mut p);
+        assert!(
+            top.iter().any(|l| l.contains(&p.board.root_hash_hex())),
+            "{top:?}"
+        );
+        p.pop_path();
+        assert!(p.at_root(), "out of the meta, back on the columns");
+
+        descend(&mut p, "Doing");
+        let inside = enter_meta(&mut p);
+        assert!(
+            inside
+                .iter()
+                .any(|l| l.contains(&p.board.columns[1].hash_hex())),
+            "{inside:?}"
+        );
+        p.pop_path();
+        assert_eq!(
+            p.current_path(),
+            "/c4",
+            "out of the meta, still in the column"
+        );
+    }
+
+    /// The one that would eat a board: the app hands back what it displayed,
+    /// meta row included.
+    #[test]
+    fn the_meta_row_is_never_stored() {
+        let mut p = seeded_with_cloud(Standing::Missing);
+        let rows = p.fetch();
+        p.sync_ffon_body_children(&rows);
+        let titles: Vec<String> = p.board.columns.iter().map(|c| c.title.clone()).collect();
+        assert_eq!(titles, vec!["To do", "Doing"]);
+
+        descend(&mut p, "To do");
+        let rows = p.fetch();
+        p.sync_ffon_body_children(&rows);
+        assert_eq!(cards(&p, 0), vec!["fix login", "write docs"]);
+    }
+
+    #[test]
+    fn the_meta_row_cannot_be_deleted_or_edited() {
+        let mut p = seeded();
+        assert!(!p.delete_item(&meta()));
+        assert!(p.take_error().is_some());
+        assert!(!p.commit_edit(&meta(), "renamed"));
+        assert!(p.take_error().is_some());
+    }
+
+    /// The lines inside the meta are rendered, and an edit handed back from
+    /// there must not reach the board.
+    #[test]
+    fn nothing_inside_the_meta_reaches_the_board() {
+        let mut p = seeded();
+        enter_meta(&mut p);
+        let before = p.board.clone();
+        let lines = p.fetch();
+        p.sync_ffon_body_children(&lines);
+        assert_eq!(p.board, before);
+    }
+
+    #[test]
+    fn the_meta_paths_round_trip_in_both_forms() {
+        let mut p = seeded();
+        enter_meta(&mut p);
+        assert_eq!(p.current_path(), "/m");
+        assert!(!p.at_root());
+
+        let mut q = seeded();
+        q.set_current_path("/m");
+        assert_eq!(q.current_path(), "/m");
+        assert_eq!(q.fetch().len(), 1, "the hash line");
+
+        let mut q = seeded();
+        q.set_current_path("/c4/m");
+        assert_eq!(q.current_path(), "/c4/m");
+        q.pop_path();
+        assert_eq!(labels(&q.fetch()), vec![meta(), "kanban ui".to_owned()]);
+
+        let mut q = seeded();
+        let _ = q.fetch();
+        q.set_current_path(&format!("/Doing/{}", meta()));
+        assert_eq!(q.current_path(), "/c4/m");
+    }
+
+    /// The app counts the dashboard's entry path and `SelectPath` in `fetch()`
+    /// rows, the cloud row and the list meta included.
+    #[test]
+    fn the_board_skips_the_rows_above_the_columns_both_ways() {
+        let mut p = seeded_with_cloud(active_licence());
+        // Cloud row, meta, To do, Doing: the cursor on "Doing", second card
+        // row (its meta first).
+        p.set_dashboard_entry(&[3, 1]);
+        p.enter_dashboard();
+        assert_eq!(p.focus, Focus { col: 1, row: 0 });
+        p.leave_dashboard();
+        assert_eq!(nav(&mut p), Some(vec![3, 1]));
+    }
+
+    #[test]
+    fn entering_the_board_from_the_meta_row_leaves_the_focus_alone() {
+        let mut p = seeded();
+        p.enter_dashboard();
+        p.focus = Focus { col: 1, row: 0 };
+        p.leave_dashboard();
+        let _ = nav(&mut p);
+        p.set_dashboard_entry(&[0]);
+        p.enter_dashboard();
+        assert_eq!(p.focus, Focus { col: 1, row: 0 });
+    }
+
+    /// The list meta says whether its list is as it was at the last sync,
+    /// from the same Merkle hash it shows.
+    #[test]
+    fn the_meta_says_whether_the_list_is_synced() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = provider_on(&dir, &host);
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
+        p.ensure_loaded();
+        p.board.columns.push(Column::new(1, "To do"));
+        p.persist();
+        let status = |p: &mut ProjectManagementProvider| {
+            let lines = enter_meta(p);
+            p.pop_path();
+            lines
+        };
+        assert!(status(&mut p).contains(&localize::t("projectmanagement-sync-status-new")));
+
+        let root = dir.path().join("board");
+        let files = sicompass_sync::snapshot::read_store(&root, "kanban")
+            .unwrap()
+            .files;
+        sicompass_sync::sync::Base {
+            hash: "h".to_owned(),
+            updated_at: None,
+            files,
+        }
+        .save(&root)
+        .unwrap();
+        p.cloud.load_base(&root);
+        assert!(status(&mut p).contains(&localize::t("projectmanagement-sync-status-synced")));
+
+        p.board.columns[0].title = "To do soon".to_owned();
+        p.persist();
+        assert!(status(&mut p).contains(&localize::t("projectmanagement-sync-status-changed")));
+    }
+
+    #[test]
+    fn no_sync_line_in_the_meta_while_sync_is_off() {
+        let mut p = seeded();
+        let lines = enter_meta(&mut p);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    /// The task, against a server that holds nothing yet: it asks the head,
+    /// then uploads the board under its server name, `kanban`.
+    #[test]
+    fn the_sync_task_uploads_the_board_to_its_server() {
+        let dir = TempDir::new().unwrap();
+        let mut p = provider(&dir);
+        p.ensure_loaded();
+        p.board.columns.push(Column::new(1, "To do"));
+        p.persist();
+
+        let sent = std::cell::RefCell::new(Vec::new());
+        let send = |r: &sicompass_sync::protocol::Request| {
+            sent.borrow_mut().push(r.clone());
+            let body = if r.method == "GET" {
+                br#"{"hash":null,"updated_at":null,"now":1}"#.to_vec()
+            } else {
+                br#"{"stored":true,"updated_at":1}"#.to_vec()
+            };
+            Ok(sicompass_sync::protocol::Response { status: 200, body })
+        };
+        sicompass_sync::cloud::run_sync(
+            &cloud::SERVICE,
+            &dir.path().join("board"),
+            Some("tok".to_owned()),
+            &send,
+        )
+        .unwrap();
+        let sent = sent.borrow();
+        assert_eq!(
+            sent[0].url,
+            "https://store.sicompass.org/plugins/kanban/head"
+        );
+        assert_eq!(sent[1].method, "PUT");
+        assert_eq!(sent[1].url, "https://store.sicompass.org/plugins/kanban");
     }
 }
 

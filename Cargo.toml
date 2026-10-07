@@ -6,12 +6,12 @@ name = "projectmanagement-plugin"
 version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Project management for sicompass: a kanban board in a list and on a grid, with optional cloud backup, as a plugin"
+description = "Project management for sicompass: a kanban board in a list and on a grid, with optional cloud sync, as a plugin"
 repository = "https://github.com/friendlyflow/projectmanagement-plugin-sicompass"
 # A plugin ships as a signed release the sicompass Store installs, never on crates.io.
 publish = false
 
-# The program sicompass starts (src/main.rs). The board and the backup logic
+# The program sicompass starts (src/main.rs). The board and the sync logic
 # are the library, which the unit tests use.
 [[bin]]
 name = "projectmanagement-plugin"
@@ -20,12 +20,12 @@ path = "src/main.rs"
 [dependencies]
 # The plugin kit (`plugin`) and the FFON model, from crates.io.
 sicompass-sdk = { version = "0.9.1", default-features = false, features = ["plugin"] }
-# Cloud backup: store snapshots, the backup protocol, debouncing and the row.
-# In the SDK repo, at the release the SDK above came from.
-sicompass-payments = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", tag = "v0.9.1" }
+# Cloud sync: the store's Merkle tree, the three-way merge, the sync protocol,
+# debouncing and the row. In the SDK repo, at an SDK release tag.
+sicompass-sync = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", tag = "v0.9.3" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# The backup's HTTP, to the backup server. rustls with bundled roots, so the
+# The sync's HTTP, to the sync server. rustls with bundled roots, so the
 # static musl build needs no system TLS library.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
@@ -46,4 +46,4 @@ codegen-units = 1
 # [patch.crates-io]
 # sicompass-sdk = { path = "../sicompass-plugin-sdk" }
 # [patch."https://github.com/friendlyflow/sicompass-plugin-sdk"]
-# sicompass-payments = { path = "../sicompass-plugin-sdk/sicompass-payments" }
+# sicompass-sync = { path = "../sicompass-plugin-sdk/sicompass-sync" }

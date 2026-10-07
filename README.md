@@ -20,24 +20,33 @@ were on.
 The archive card command retires a card into an archive column. The board does
 not draw it, and the list does. Move a card left to take it back out.
 
+The first row of every list is its list meta. It shows a hash of the list
+that changes whenever anything in it changes, the same kind of hash notes
+have.
+
 Your board is plain files in your Sicompass data folder, on your own
 computer.
 
-## Cloud backup
+## Cloud sync
 
-Cloud backup is off until you turn it on, in Settings, under project
+Cloud sync is off until you turn it on, in Settings, under project
 management. With it on, a row above the columns says where your subscription
-stands, and a copy of your board goes to the Sicompass Cloud server a few
-seconds after you stop editing.
+stands, and your board stays the same on every computer you turn it on for. A
+few seconds after you stop editing, and once a minute otherwise, Sicompass
+sends your changes to the Sicompass Cloud server and brings in the changes you
+made elsewhere.
 
-Cloud backup is part of Sicompass Cloud, which you buy and redeem in the Store,
+The hashes are how Sicompass and the server know which columns and cards are
+out of date, and the list meta also says whether a list changed since the last
+sync. When the same card was changed on two computers, the latest change is
+kept. A card deleted on one computer and edited on another is kept.
+
+Cloud sync is part of Sicompass Cloud, which you buy and redeem in the Store,
 under tiers. Without it your board works exactly the same, and is only not
-copied to the server. After a subscription ends, backup keeps running for 14
-more days.
+synced. After a subscription ends, sync keeps running for 14 more days.
 
-To get your board back on a new computer, turn cloud backup on and run restore
-cloud backup from the command palette. It only restores into an empty board,
-and never over a board you already have.
+On a new computer, turn cloud sync on, and your board arrives. Sync with the
+cloud now, in the command palette, does it at once.
 
 ## Install
 
@@ -49,7 +58,7 @@ it, and keeps it up to date.
 
 ```bash
 nix develop          # the toolchain
-cargo test           # the board, the list and the backup logic
+cargo test           # the board, the list and the sync logic
 cargo build --release
 cp target/release/projectmanagement-plugin plugin
 ```
@@ -67,7 +76,7 @@ it, and signs and verifies it with a throwaway key, the way a release is made.
 
 - [sicompass](https://github.com/friendlyflow/sicompass), the application
 - [sicompass-plugin-sdk](https://github.com/friendlyflow/sicompass-plugin-sdk),
-  the SDK, the plugin kit and the cloud backup library
+  the SDK, the plugin kit and the cloud sync library (`sicompass-sync`)
 
 ## Community
 

@@ -9,6 +9,17 @@
 //! two", and one that forgot would silently grow a third level that the board
 //! view has nowhere to draw. Here the type system says it instead — a `Card` has
 //! no children field to fill in.
+//!
+//! # Merkle hashes
+//!
+//! Every card, column and the board itself has a hash, the notes plugin's
+//! formula from `sicompass_sync::merkle` (a wire format, shared with the sync
+//! server): a card is a leaf, a column a branch over its cards, the board the
+//! root over its columns. Ids and the archive flag are not hashed: two copies
+//! of a board that read alike hash alike. A column is always a branch, even an
+//! empty one, matching the store, which gives every column a card folder.
+
+use sicompass_sync::merkle;
 
 /// A card's or column's local identity. Minted once, never reused.
 ///
@@ -32,6 +43,10 @@ impl Card {
             text: text.into(),
         }
     }
+
+    pub fn hash(&self) -> [u8; 32] {
+        merkle::leaf_hash(&self.text)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +63,15 @@ impl Column {
             title: title.into(),
             cards: Vec::new(),
         }
+    }
+
+    pub fn hash(&self) -> [u8; 32] {
+        let cards: Vec<[u8; 32]> = self.cards.iter().map(Card::hash).collect();
+        merkle::branch_hash(&self.title, &cards)
+    }
+
+    pub fn hash_hex(&self) -> String {
+        merkle::hex(&self.hash())
     }
 }
 
@@ -142,6 +166,28 @@ impl Board {
     /// is the line that has to hold for that to be true.
     pub fn reseat_counter(&mut self) {
         self.next_id = self.next_id.max(self.max_id() + 1);
+    }
+
+    /// The next id [`Board::mint_id`] would hand out.
+    pub fn next_id(&self) -> Id {
+        self.next_id
+    }
+
+    /// Never hand out an id below `floor`. A reload (after a sync merged
+    /// another computer's board in) starts the counter from what is on disk,
+    /// which can be lower than ids the undo timeline still holds.
+    pub fn raise_counter(&mut self, floor: Id) {
+        self.next_id = self.next_id.max(floor);
+    }
+
+    /// The board's root hash: what changes when anything on it changes.
+    pub fn root_hash(&self) -> [u8; 32] {
+        let columns: Vec<[u8; 32]> = self.columns.iter().map(Column::hash).collect();
+        merkle::root_hash(&columns)
+    }
+
+    pub fn root_hash_hex(&self) -> String {
+        merkle::hex(&self.root_hash())
     }
 
     pub fn mint_id(&mut self) -> Id {

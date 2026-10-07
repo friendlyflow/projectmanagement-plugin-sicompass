@@ -581,8 +581,8 @@ version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
- "sicompass-payments",
  "sicompass-sdk",
+ "sicompass-sync",
  "tempfile",
  "ureq",
 ]
@@ -804,16 +804,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "sicompass-payments"
-version = "0.2.0"
-source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?tag=v0.9.1#20b7e7e3394cda60bf622ca7291ef3b23d7c2f52"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "sicompass-sdk"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -828,6 +818,16 @@ dependencies = [
  "unicode-normalization",
  "url",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sicompass-sync"
+version = "0.3.0"
+source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?tag=v0.9.3#9ea3489bd47d52b9ebfbddf51d1bf0c11a6f3143"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -22,7 +22,7 @@ GitHub releases, one build per platform. The plugin platform is described in
   `sicompass_sdk::plugin::storage_dir()`, which is
   `<data dir>/projectmanagement`, the folder the old built-in used, so existing
   boards open unchanged) and `allowedHosts ["store.sicompass.org"]` (the
-  backup server). `service.tier` is
+  sync server). `service.tier` is
   `friendlyflow/cloud`, which is what lets `license::token` hand this plugin
   the user's Sicompass Cloud redeem token.
 - `locales/<lang>.ftl`, every id prefixed `projectmanagement-`, in all four
@@ -33,9 +33,9 @@ GitHub releases, one build per platform. The plugin platform is described in
   the list surface, the board dashboard and its keys, and board undo.
   `src/main.rs` makes it the program. `board.rs` is the model, `store.rs` the on-disk format, `render.rs` draws
   the board, `escape.rs` escapes every row.
-- `src/cloud.rs` is the optional cloud backup (the server store is named
-  `kanban`, settings key `kanbanCloudBackup`), on the `sicompass-payments`
-  library, with a host of its own (`PluginHost`): the app through the plugin
+- `src/cloud.rs` is the optional cloud sync (the server store is named
+  `kanban`, settings key `kanbanCloudBackup`, both kept from when it was a
+  backup), on the `sicompass-sync` library, with a host of its own (`PluginHost`): the app through the plugin
   kit, threads for the tasks, and `ureq` (rustls) for the HTTP.
 
 ## Two surfaces, one board
@@ -56,23 +56,35 @@ surface. In short:
   requests and navigation requests use the interface's types throughout.
 - **The archive is an ordinary column**, pinned last, which the board stops
   drawing one short of. `clamp_focus` is what keeps the board cursor off it.
+- **Every list opens with its list meta**, a rendered `Obj` (never stored,
+  never editable) holding the Merkle hash of the board or column and, with
+  sync on, its sync status. The board view draws from `Board` and never sees
+  it, but the app counts it: the dashboard entry path and `SelectPath` are
+  `fetch()` row indices, so they go through `lead_rows`.
 
-## Cloud backup: three things that are easy to get wrong
+## Cloud sync: four things that are easy to get wrong
 
+- **The hash is a wire format, and not this repo's.** `board.rs` applies
+  `sicompass_sync::merkle`'s formula (the notes plugin's), which the server and
+  every other computer share. The saved store must stay byte for byte its
+  canonical form (`merkle::to_files`), which a test checks: otherwise every
+  sync uploads a rewrite of it.
 - **The paywall is on the service, never on the data.** Whatever
   `license::standing` says, the board is listed and saved to disk. Only the
-  upload is gated (active or grace).
-- **The backup row is rendered, never stored.** It carries `<id>cloud</id>`,
-  and `reconcile_columns` skips it. The app hands back whatever it displayed,
-  so without that the row becomes a column. It never links anywhere: buying
-  and redeeming are in the Store, under tiers.
-- **Nothing slow runs on the calls from the app.** The app waits for
-  every call to answer. `persist` only marks the debounce. `poll` starts a backup task
-  once the board is quiet, and restore is a task too. A task runs on a thread
-  of its own (`PluginHost::spawn`), with only the board's folder on disk, the
-  token and its `input`. `poll` hands its result to
-  `ProjectManagementProvider::task_done`. Restore never runs over a board that
-  has columns, checked both in the UI and in the task.
+  sync is gated (active or grace).
+- **The sync row and the list meta are rendered, never stored.** The sync row
+  carries `<id>cloud</id>`, the meta row is matched by its localized label, and
+  `reconcile` skips both. The app hands back whatever it displayed, so without
+  that either becomes a column. The sync row never links anywhere: buying and
+  redeeming are in the Store, under tiers.
+- **Nothing slow runs on the calls from the app.** The app waits for every
+  call to answer. `persist` only marks the debounce. `poll` starts a sync task
+  at start-up, once the board is quiet, and every minute. A task runs on a
+  thread of its own (`PluginHost::spawn`), with only the board's folder on
+  disk and the token. `poll` hands its result to
+  `ProjectManagementProvider::task_done`, where what another computer changed
+  is written and the board read again, unless the board was saved meanwhile
+  (then the next sync merges again).
 
 ## Environment (Nix)
 
@@ -131,7 +143,7 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/projectmanagement.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK comes from crates.io, and `sicompass-payments` by git at the SDK's
+The SDK comes from crates.io, and `sicompass-sync` by git at the SDK's
 release tag (the source is all in `../sicompass-plugin-sdk`). The
 commented-out `[patch]` in `Cargo.toml` is for working on them together, and
 stays commented on main.

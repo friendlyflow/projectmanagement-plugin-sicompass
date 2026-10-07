@@ -2,10 +2,11 @@
 //!
 //! ```text
 //! projectmanagement/
-//! |-- .listmeta        {"children":[{"n":1,"id":1},{"n":2,"id":4,"archive":true}]}
+//! |-- .listmeta        {"sha256":"<board>","children":[{"n":1,"id":1,"sha256":"<column>"},
+//! |                     {"n":2,"id":4,"sha256":"...","archive":true}]}
 //! |-- 0001             "To do"                    a column's own file
 //! |-- 0001.d/                                     its cards
-//! |   |-- .listmeta    {"children":[{"n":1,"id":2},{"n":2,"id":3}]}
+//! |   |-- .listmeta    {"sha256":"<column>","children":[{"n":1,"id":2,"sha256":"<card>"},...]}
 //! |   |-- 0001         "fix login"
 //! |   `-- 0002         "write docs"
 //! |-- 0002             "Doing"
@@ -14,9 +15,14 @@
 //!     `-- 0001         "kanban ui"
 //! ```
 //!
-//! Deliberately the same layout as `lib_notes`, so a board is as inspectable,
-//! greppable and mergeable as a note tree, minus that provider's Merkle chain: a
-//! board has no peer-sync story to justify hashing every level.
+//! Deliberately the same layout as the notes plugin's, Merkle hashes included,
+//! so a board is as inspectable, greppable and mergeable as a note tree, and
+//! the same sync (`sicompass_sync`) keeps it alike on every computer: each
+//! `.listmeta` carries the hash of the column (or board) that owns it, and of
+//! each child, so a peer can tell which column changed without reading a card.
+//! What this writes is byte for byte the store's canonical form
+//! (`sicompass_sync::merkle::to_files`), which a test checks. A store written
+//! without hashes (an older version, the Trello script) still loads.
 //!
 //! A file's contents are the card's or column's text, verbatim, with no trailing
 //! newline. The `NNNN` prefix carries order and nothing else: it is renumbered
@@ -44,6 +50,10 @@ pub struct ChildMeta {
     /// 1-based position, matching the file name.
     pub n: usize,
     pub id: Id,
+    /// The child's Merkle hash. Read back for nothing: it is recomputed on
+    /// every save.
+    #[serde(default)]
+    pub sha256: String,
     /// True for the one column that is the archive. Only ever set in the root
     /// `.listmeta`, because only a column can be the archive.
     ///
@@ -61,6 +71,10 @@ fn is_not_archive(flag: &bool) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ListMeta {
+    /// The Merkle hash of the column that owns this list, or the board's root
+    /// hash at the top.
+    #[serde(default)]
+    pub sha256: String,
     /// Per-child position and id, so identity survives a rename or a reorder.
     #[serde(default)]
     pub children: Vec<ChildMeta>,
@@ -222,20 +236,23 @@ pub fn save_board(root: &Path, board: &Board) -> std::io::Result<()> {
 
         let card_dir = root.join(child_dir_name(n));
         keep.push(child_dir_name(n));
-        save_cards(&card_dir, &col.cards)?;
+
+        let hash = col.hash_hex();
+        save_cards(&card_dir, &col.cards, &hash)?;
 
         children.push(ChildMeta {
             n,
             id: col.id,
+            sha256: hash,
             archive: board.is_archive(col.id),
         });
     }
 
     prune(root, &keep)?;
-    write_meta(root, children)
+    write_meta(root, board.root_hash_hex(), children)
 }
 
-fn save_cards(dir: &Path, cards: &[Card]) -> std::io::Result<()> {
+fn save_cards(dir: &Path, cards: &[Card], column_hash: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut keep: Vec<String> = vec![LISTMETA.to_owned()];
     let mut children = Vec::with_capacity(cards.len());
@@ -246,13 +263,14 @@ fn save_cards(dir: &Path, cards: &[Card]) -> std::io::Result<()> {
         children.push(ChildMeta {
             n,
             id: card.id,
+            sha256: sicompass_sync::merkle::hex(&card.hash()),
             // Only a column can be the archive, so a card's meta never carries
             // the flag and `skip_serializing_if` keeps it out of the bytes.
             archive: false,
         });
     }
     prune(dir, &keep)?;
-    write_meta(dir, children)
+    write_meta(dir, column_hash.to_owned(), children)
 }
 
 /// Remove what belonged to an entry that is gone, or to a position the list has
@@ -284,8 +302,8 @@ fn prune(dir: &Path, keep: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_meta(dir: &Path, children: Vec<ChildMeta>) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(&ListMeta { children }).unwrap_or_default();
+fn write_meta(dir: &Path, sha256: String, children: Vec<ChildMeta>) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(&ListMeta { sha256, children }).unwrap_or_default();
     write_if_changed(&dir.join(LISTMETA), &json)
 }
 
@@ -515,6 +533,117 @@ mod tests {
         assert_eq!(
             back.columns[0].id, 4,
             "identity follows the id, not the name"
+        );
+    }
+
+    // ---- Merkle hashes ---------------------------------------------------
+
+    fn files_of(root: &Path) -> std::collections::BTreeMap<String, String> {
+        sicompass_sync::snapshot::read_store(root, "kanban")
+            .unwrap()
+            .files
+    }
+
+    /// What this writes is the store's canonical form, every hash right: the
+    /// sync uploads it as it is, and a peer's diff can trust it.
+    #[test]
+    fn a_saved_board_is_its_own_canonical_form() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("board");
+        save_board(&root, &with_archive()).unwrap();
+        let files = files_of(&root);
+        assert_eq!(
+            sicompass_sync::merkle::verify(&files),
+            sicompass_sync::merkle::Verified::Ok
+        );
+        assert_eq!(
+            sicompass_sync::merkle::to_files(&sicompass_sync::merkle::parse(&files)),
+            files
+        );
+    }
+
+    /// The hashes the board computes are the ones the shared module reads off
+    /// the files, so the board, the sync and the server agree.
+    #[test]
+    fn the_boards_hashes_are_the_stores() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("board");
+        let board = sample();
+        save_board(&root, &board).unwrap();
+        let tree = sicompass_sync::merkle::parse(&files_of(&root));
+        assert_eq!(tree.root_hash(), board.root_hash());
+        let hashes = tree.hashes();
+        assert_eq!(hashes[&1], board.columns[0].hash_hex());
+        assert_eq!(
+            hashes[&5],
+            sicompass_sync::merkle::hex(&board.columns[1].cards[0].hash())
+        );
+    }
+
+    /// The board vector the sync crate pins: To do [fix login, write docs],
+    /// Doing [kanban ui], Archive [].
+    #[test]
+    fn the_root_hash_matches_the_published_vector() {
+        let mut b = sample();
+        let mut archive = Column::new(7, "Archive");
+        archive.cards.clear();
+        b.columns.push(archive);
+        b.set_archive(7);
+        assert_eq!(
+            b.columns[0].hash_hex(),
+            "1de2213ad66453d1d5afab7d344604da9da19f0e0c55dcc6dfa9e59470b0fd26"
+        );
+        assert_eq!(
+            b.root_hash_hex(),
+            "ca4e849aee0589b69f232b07c8d6fed5a793ec7e412738e6dd9c156f0650ef40"
+        );
+    }
+
+    #[test]
+    fn ids_and_the_archive_flag_leave_the_hash_alone() {
+        let before = sample().root_hash();
+        let mut b = sample();
+        b.columns[0].id = 40;
+        b.columns[0].cards[0].id = 41;
+        b.set_archive(4);
+        assert_eq!(b.root_hash(), before);
+    }
+
+    #[test]
+    fn an_edit_or_a_reorder_changes_the_root_and_only_its_column() {
+        let a = sample();
+        let mut b = sample();
+        b.columns[0].cards[1].text = "write the docs".to_owned();
+        assert_ne!(b.root_hash(), a.root_hash());
+        assert_ne!(b.columns[0].hash(), a.columns[0].hash());
+        assert_eq!(b.columns[1].hash(), a.columns[1].hash());
+
+        let mut c = sample();
+        c.columns.swap(0, 1);
+        assert_ne!(c.root_hash(), a.root_hash());
+    }
+
+    /// A store written without hashes (an older version, the Trello script)
+    /// still loads, and the next save adds them.
+    #[test]
+    fn a_store_without_hashes_loads_and_gains_them() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("board");
+        std::fs::create_dir_all(root.join("0001.d")).unwrap();
+        std::fs::write(root.join(LISTMETA), r#"{"children":[{"n":1,"id":1}]}"#).unwrap();
+        std::fs::write(root.join("0001"), "To do").unwrap();
+        std::fs::write(
+            root.join("0001.d").join(LISTMETA),
+            r#"{"children":[{"n":1,"id":2}]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("0001.d").join("0001"), "fix login").unwrap();
+        let board = load_board(&root).unwrap();
+        assert_eq!(board.columns[0].cards[0].text, "fix login");
+        save_board(&root, &board).unwrap();
+        assert_eq!(
+            sicompass_sync::merkle::verify(&files_of(&root)),
+            sicompass_sync::merkle::Verified::Ok
         );
     }
 }
