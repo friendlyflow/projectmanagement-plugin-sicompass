@@ -45,7 +45,7 @@
 //! # Every list opens with its header
 //!
 //! Like the notes plugin's, the first row of the columns list and of every
-//! column is a `header:` row (below the cloud row, at the top). Inside it:
+//! column is a `header` row (below the cloud row, at the top). Inside it:
 //! the Merkle hash of the board or of that column (`board.rs`), which changes
 //! when anything in it changes, and, while cloud sync is on, whether it is as
 //! it was at the last sync. It is rendered, never stored: `reconcile` skips
@@ -490,7 +490,7 @@ impl ProjectManagementProvider {
 
     // ---- The header ---------------------------------------------------------
 
-    /// The `header:` row's text.
+    /// The `header` row's text.
     ///
     /// Localized, and therefore never literally `"meta"`: the app special-cases
     /// an Obj keyed exactly `"meta"` and skips `pop_path` when leaving it,
