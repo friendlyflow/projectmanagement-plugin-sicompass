@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - The first row of every list is called header now (it was list meta). In Dutch it is kop, in French en-tête and in German Kopfzeile.
 - Each list's file on disk is `.header` now. A `.listmeta` from before is still read, and replaced on the next save or sync.
