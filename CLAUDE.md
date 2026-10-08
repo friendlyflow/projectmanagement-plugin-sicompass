@@ -56,7 +56,7 @@ surface. In short:
   requests and navigation requests use the interface's types throughout.
 - **The archive is an ordinary column**, pinned last, which the board stops
   drawing one short of. `clamp_focus` is what keeps the board cursor off it.
-- **Every list opens with its list meta**, a rendered `Obj` (never stored,
+- **Every list opens with its header**, a rendered `Obj` (never stored,
   never editable) holding the Merkle hash of the board or column and, with
   sync on, its sync status. The board view draws from `Board` and never sees
   it, but the app counts it: the dashboard entry path and `SelectPath` are
@@ -72,8 +72,8 @@ surface. In short:
 - **The paywall is on the service, never on the data.** Whatever
   `license::standing` says, the board is listed and saved to disk. Only the
   sync is gated (active or grace).
-- **The sync row and the list meta are rendered, never stored.** The sync row
-  carries `<id>cloud</id>`, the meta row is matched by its localized label, and
+- **The sync row and the header are rendered, never stored.** The sync row
+  carries `<id>cloud</id>`, the header row is matched by its localized label, and
   `reconcile` skips both. The app hands back whatever it displayed, so without
   that either becomes a column. The sync row never links anywhere: buying and
   redeeming are in the Store, under tiers.

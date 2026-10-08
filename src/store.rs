@@ -2,23 +2,23 @@
 //!
 //! ```text
 //! projectmanagement/
-//! |-- .listmeta        {"sha256":"<board>","children":[{"n":1,"id":1,"sha256":"<column>"},
+//! |-- .header          {"sha256":"<board>","children":[{"n":1,"id":1,"sha256":"<column>"},
 //! |                     {"n":2,"id":4,"sha256":"...","archive":true}]}
 //! |-- 0001             "To do"                    a column's own file
 //! |-- 0001.d/                                     its cards
-//! |   |-- .listmeta    {"sha256":"<column>","children":[{"n":1,"id":2,"sha256":"<card>"},...]}
+//! |   |-- .header      {"sha256":"<column>","children":[{"n":1,"id":2,"sha256":"<card>"},...]}
 //! |   |-- 0001         "fix login"
 //! |   `-- 0002         "write docs"
 //! |-- 0002             "Doing"
 //! `-- 0002.d/
-//!     |-- .listmeta
+//!     |-- .header
 //!     `-- 0001         "kanban ui"
 //! ```
 //!
 //! Deliberately the same layout as the notes plugin's, Merkle hashes included,
 //! so a board is as inspectable, greppable and mergeable as a note tree, and
 //! the same sync (`sicompass_sync`) keeps it alike on every computer: each
-//! `.listmeta` carries the hash of the column (or board) that owns it, and of
+//! `.header` carries the hash of the column (or board) that owns it, and of
 //! each child, so a peer can tell which column changed without reading a card.
 //! What this writes is byte for byte the store's canonical form
 //! (`sicompass_sync::merkle::to_files`), which a test checks. A store written
@@ -27,12 +27,15 @@
 //! A file's contents are the card's or column's text, verbatim, with no trailing
 //! newline. The `NNNN` prefix carries order and nothing else: it is renumbered
 //! densely on every insert, delete and reorder so that `ls` order is board order.
-//! Identity lives in `.listmeta`, not in the name, which is why renaming a column
+//! Identity lives in `.header`, not in the name, which is why renaming a column
 //! does not have to touch a single card.
 //!
 //! `.d` is what keeps the layout legal: POSIX will not hold a file and a
 //! directory of the same name in one parent, so a column's cards go in a sibling
 //! folder rather than one named after the column's own file.
+//!
+//! The sidecar used to be called `.listmeta`. A folder that still has one is
+//! read from it, and the next save writes `.header` and removes it.
 
 use crate::board::{Board, Card, Column, Id};
 use serde::{Deserialize, Serialize};
@@ -40,7 +43,11 @@ use std::path::Path;
 
 /// The sidecar. Named with a leading dot so it sorts away from the numbered
 /// entries and is skipped by the `NNNN` filter on load.
-pub const LISTMETA: &str = ".listmeta";
+pub const HEADER: &str = ".header";
+
+/// What [`HEADER`] was called before: read when there is no `.header`, and
+/// removed by the next save.
+pub const LEGACY_HEADER: &str = ".listmeta";
 
 /// Suffix for a column's card folder.
 pub const CHILD_DIR_SUFFIX: &str = ".d";
@@ -55,7 +62,7 @@ pub struct ChildMeta {
     #[serde(default)]
     pub sha256: String,
     /// True for the one column that is the archive. Only ever set in the root
-    /// `.listmeta`, because only a column can be the archive.
+    /// `.header`, because only a column can be the archive.
     ///
     /// Skipped when false rather than written as `false` everywhere. Without
     /// that, the first save by this version would rewrite every sidecar in the
@@ -70,7 +77,7 @@ fn is_not_archive(flag: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ListMeta {
+pub struct ListHeader {
     /// The Merkle hash of the column that owns this list, or the board's root
     /// hash at the top.
     #[serde(default)]
@@ -89,7 +96,7 @@ fn child_dir_name(n: usize) -> String {
 }
 
 /// A `NNNN` entry name back to its position, or `None` for anything else
-/// (`.listmeta`, a `.d` folder, a stray file a user dropped in).
+/// (`.header`, a `.d` folder, a stray file a user dropped in).
 fn parse_entry_name(name: &str) -> Option<usize> {
     if name.len() == 4 && name.bytes().all(|b| b.is_ascii_digit()) {
         name.parse().ok()
@@ -133,8 +140,10 @@ pub fn load_board(root: &Path) -> Option<Board> {
     Some(board)
 }
 
-fn read_listmeta(dir: &Path) -> Option<ListMeta> {
-    let raw = std::fs::read_to_string(dir.join(LISTMETA)).ok()?;
+fn read_header(dir: &Path) -> Option<ListHeader> {
+    let raw = std::fs::read_to_string(dir.join(HEADER))
+        .or_else(|_| std::fs::read_to_string(dir.join(LEGACY_HEADER)))
+        .ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -157,8 +166,9 @@ fn positions(dir: &Path) -> Option<Vec<usize>> {
 /// Zero rather than a freshly minted id, because minting here would risk
 /// colliding with an id further down that has not been read yet.
 /// `Board::assign_missing_ids` fills these in once the whole board is loaded.
-fn id_at(meta: &Option<ListMeta>, n: usize) -> Id {
-    meta.as_ref()
+fn id_at(header: &Option<ListHeader>, n: usize) -> Id {
+    header
+        .as_ref()
         .and_then(|m| m.children.iter().find(|c| c.n == n))
         .map(|c| c.id)
         .unwrap_or(0)
@@ -170,7 +180,7 @@ fn id_at(meta: &Option<ListMeta>, n: usize) -> Id {
 /// see [`load_board`]. A second flagged child (only a hand edit can produce one)
 /// is ignored: the first wins and the rest stay ordinary columns.
 fn load_columns(dir: &Path) -> Option<(Vec<Column>, Option<usize>)> {
-    let meta = read_listmeta(dir);
+    let header = read_header(dir);
     let mut out = Vec::new();
     let mut archive_at = None;
     for n in positions(dir)? {
@@ -181,11 +191,11 @@ fn load_columns(dir: &Path) -> Option<(Vec<Column>, Option<usize>)> {
         } else {
             Vec::new()
         };
-        if archive_at.is_none() && is_archive_at(&meta, n) {
+        if archive_at.is_none() && is_archive_at(&header, n) {
             archive_at = Some(out.len());
         }
         out.push(Column {
-            id: id_at(&meta, n),
+            id: id_at(&header, n),
             title,
             cards,
         });
@@ -194,8 +204,9 @@ fn load_columns(dir: &Path) -> Option<(Vec<Column>, Option<usize>)> {
 }
 
 /// Whether the child at position `n` carries the archive flag.
-fn is_archive_at(meta: &Option<ListMeta>, n: usize) -> bool {
-    meta.as_ref()
+fn is_archive_at(header: &Option<ListHeader>, n: usize) -> bool {
+    header
+        .as_ref()
         .and_then(|m| m.children.iter().find(|c| c.n == n))
         .is_some_and(|c| c.archive)
 }
@@ -205,12 +216,12 @@ fn is_archive_at(meta: &Option<ListMeta>, n: usize) -> bool {
 /// hand-created by a user is ignored rather than silently loaded and then
 /// deleted by the next save.
 fn load_cards(dir: &Path) -> Option<Vec<Card>> {
-    let meta = read_listmeta(dir);
+    let header = read_header(dir);
     let mut out = Vec::new();
     for n in positions(dir)? {
         let text = std::fs::read_to_string(dir.join(entry_name(n))).ok()?;
         out.push(Card {
-            id: id_at(&meta, n),
+            id: id_at(&header, n),
             text,
         });
     }
@@ -226,7 +237,7 @@ fn load_cards(dir: &Path) -> Option<Vec<Card>> {
 pub fn save_board(root: &Path, board: &Board) -> std::io::Result<()> {
     std::fs::create_dir_all(root)?;
 
-    let mut keep: Vec<String> = vec![LISTMETA.to_owned()];
+    let mut keep: Vec<String> = vec![HEADER.to_owned()];
     let mut children = Vec::with_capacity(board.columns.len());
 
     for (i, col) in board.columns.iter().enumerate() {
@@ -249,12 +260,12 @@ pub fn save_board(root: &Path, board: &Board) -> std::io::Result<()> {
     }
 
     prune(root, &keep)?;
-    write_meta(root, board.root_hash_hex(), children)
+    write_header(root, board.root_hash_hex(), children)
 }
 
 fn save_cards(dir: &Path, cards: &[Card], column_hash: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let mut keep: Vec<String> = vec![LISTMETA.to_owned()];
+    let mut keep: Vec<String> = vec![HEADER.to_owned()];
     let mut children = Vec::with_capacity(cards.len());
     for (i, card) in cards.iter().enumerate() {
         let n = i + 1;
@@ -264,13 +275,13 @@ fn save_cards(dir: &Path, cards: &[Card], column_hash: &str) -> std::io::Result<
             n,
             id: card.id,
             sha256: sicompass_sync::merkle::hex(&card.hash()),
-            // Only a column can be the archive, so a card's meta never carries
+            // Only a column can be the archive, so a card's header never carries
             // the flag and `skip_serializing_if` keeps it out of the bytes.
             archive: false,
         });
     }
     prune(dir, &keep)?;
-    write_meta(dir, column_hash.to_owned(), children)
+    write_header(dir, column_hash.to_owned(), children)
 }
 
 /// Remove what belonged to an entry that is gone, or to a position the list has
@@ -302,9 +313,14 @@ fn prune(dir: &Path, keep: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_meta(dir: &Path, sha256: String, children: Vec<ChildMeta>) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(&ListMeta { sha256, children }).unwrap_or_default();
-    write_if_changed(&dir.join(LISTMETA), &json)
+fn write_header(dir: &Path, sha256: String, children: Vec<ChildMeta>) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(&ListHeader { sha256, children }).unwrap_or_default();
+    write_if_changed(&dir.join(HEADER), &json)?;
+    // Only once the `.header` is written, so a list is never without one.
+    match std::fs::remove_file(dir.join(LEGACY_HEADER)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Write only when the bytes differ, so an untouched card keeps its mtime and a
@@ -459,7 +475,7 @@ mod tests {
         let root = dir.path().join("board");
         save_board(&root, &sample()).unwrap();
         for dir in [root.clone(), root.join("0001.d"), root.join("0002.d")] {
-            let raw = std::fs::read_to_string(dir.join(LISTMETA)).unwrap();
+            let raw = std::fs::read_to_string(dir.join(HEADER)).unwrap();
             assert!(!raw.contains("archive"), "{dir:?} carries a flag: {raw}");
         }
     }
@@ -470,14 +486,14 @@ mod tests {
         let root = dir.path().join("board");
         save_board(&root, &with_archive()).unwrap();
         assert_eq!(
-            std::fs::read_to_string(root.join(LISTMETA))
+            std::fs::read_to_string(root.join(HEADER))
                 .unwrap()
                 .matches("\"archive\"")
                 .count(),
             1
         );
         // A card is never the archive, so no card's sidecar mentions it.
-        let cards = std::fs::read_to_string(root.join("0003.d").join(LISTMETA)).unwrap();
+        let cards = std::fs::read_to_string(root.join("0003.d").join(HEADER)).unwrap();
         assert!(!cards.contains("archive"), "{cards}");
     }
 
@@ -492,7 +508,7 @@ mod tests {
         // As an older version, or a hand edit, would leave it: the flag is there
         // but the ids are not.
         std::fs::write(
-            root.join(LISTMETA),
+            root.join(HEADER),
             r#"{"children":[{"n":1,"id":0},{"n":2,"id":0},{"n":3,"id":0,"archive":true}]}"#,
         )
         .unwrap();
@@ -510,7 +526,7 @@ mod tests {
         let root = dir.path().join("board");
         save_board(&root, &sample()).unwrap();
         std::fs::write(
-            root.join(LISTMETA),
+            root.join(HEADER),
             r#"{"children":[{"n":1,"id":1,"archive":true},{"n":2,"id":4}]}"#,
         )
         .unwrap();
@@ -630,10 +646,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("board");
         std::fs::create_dir_all(root.join("0001.d")).unwrap();
-        std::fs::write(root.join(LISTMETA), r#"{"children":[{"n":1,"id":1}]}"#).unwrap();
+        std::fs::write(root.join(HEADER), r#"{"children":[{"n":1,"id":1}]}"#).unwrap();
         std::fs::write(root.join("0001"), "To do").unwrap();
         std::fs::write(
-            root.join("0001.d").join(LISTMETA),
+            root.join("0001.d").join(HEADER),
             r#"{"children":[{"n":1,"id":2}]}"#,
         )
         .unwrap();
@@ -641,6 +657,40 @@ mod tests {
         let board = load_board(&root).unwrap();
         assert_eq!(board.columns[0].cards[0].text, "fix login");
         save_board(&root, &board).unwrap();
+        assert_eq!(
+            sicompass_sync::merkle::verify(&files_of(&root)),
+            sicompass_sync::merkle::Verified::Ok
+        );
+    }
+
+    /// A board saved before the sidecar was renamed, every `.header` still a
+    /// `.listmeta`: it loads with its ids and its archive, and the next save
+    /// leaves only `.header` files.
+    #[test]
+    fn a_board_under_the_old_sidecar_name_loads_and_is_renamed_by_a_save() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("board");
+        let board = with_archive();
+        save_board(&root, &board).unwrap();
+        let dirs = [
+            root.clone(),
+            root.join("0001.d"),
+            root.join("0002.d"),
+            root.join("0003.d"),
+        ];
+        for d in &dirs {
+            std::fs::rename(d.join(HEADER), d.join(LEGACY_HEADER)).unwrap();
+        }
+
+        let back = load_board(&root).unwrap();
+        assert_eq!(back.columns, board.columns);
+        assert_eq!(back.archive_id(), Some(9));
+
+        save_board(&root, &back).unwrap();
+        for d in &dirs {
+            assert!(d.join(HEADER).is_file(), "{}", d.display());
+            assert!(!d.join(LEGACY_HEADER).exists(), "{}", d.display());
+        }
         assert_eq!(
             sicompass_sync::merkle::verify(&files_of(&root)),
             sicompass_sync::merkle::Verified::Ok

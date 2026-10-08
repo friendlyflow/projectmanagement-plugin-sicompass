@@ -822,8 +822,8 @@ dependencies = [
 
 [[package]]
 name = "sicompass-sync"
-version = "0.3.0"
-source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?tag=v0.9.3#9ea3489bd47d52b9ebfbddf51d1bf0c11a6f3143"
+version = "0.4.0"
+source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?tag=v0.9.4#f839ad0fe318723172c545a6392906f870e84143"
 dependencies = [
  "serde",
  "serde_json",

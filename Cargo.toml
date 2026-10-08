@@ -22,7 +22,7 @@ path = "src/main.rs"
 sicompass-sdk = { version = "0.9.1", default-features = false, features = ["plugin"] }
 # Cloud sync: the store's Merkle tree, the three-way merge, the sync protocol,
 # debouncing and the row. In the SDK repo, at an SDK release tag.
-sicompass-sync = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", tag = "v0.9.3" }
+sicompass-sync = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", tag = "v0.9.4" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The sync's HTTP, to the sync server. rustls with bundled roots, so the

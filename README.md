@@ -20,7 +20,7 @@ were on.
 The archive card command retires a card into an archive column. The board does
 not draw it, and the list does. Move a card left to take it back out.
 
-The first row of every list is its list meta. It shows a hash of the list
+The first row of every list is its header. It shows a hash of the list
 that changes whenever anything in it changes, the same kind of hash notes
 have.
 
@@ -37,7 +37,7 @@ sends your changes to the Sicompass Cloud server and brings in the changes you
 made elsewhere.
 
 The hashes are how Sicompass and the server know which columns and cards are
-out of date, and the list meta also says whether a list changed since the last
+out of date, and the header also says whether a list changed since the last
 sync. When the same card was changed on two computers, the latest change is
 kept. A card deleted on one computer and edited on another is kept.
 

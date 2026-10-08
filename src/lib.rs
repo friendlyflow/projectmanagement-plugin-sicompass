@@ -42,10 +42,10 @@
 //! There is no `unarchive` command, because the archive is a real column and
 //! `move left` already walks a card back out of it.
 //!
-//! # Every list opens with its list meta
+//! # Every list opens with its header
 //!
 //! Like the notes plugin's, the first row of the columns list and of every
-//! column is a `list meta:` row (below the cloud row, at the top). Inside it:
+//! column is a `header:` row (below the cloud row, at the top). Inside it:
 //! the Merkle hash of the board or of that column (`board.rs`), which changes
 //! when anything in it changes, and, while cloud sync is on, whether it is as
 //! it was at the last sync. It is rendered, never stored: `reconcile` skips
@@ -252,10 +252,10 @@ struct EditState {
 pub struct ProjectManagementProvider {
     board: Board,
     /// The column the list cursor has descended into, if any. A board is two
-    /// levels deep, so this and `in_meta` are the whole path.
+    /// levels deep, so this and `in_header` are the whole path.
     open_column: Option<Id>,
-    /// Inside the list meta of the open column, or of the board at the top.
-    in_meta: bool,
+    /// Inside the header of the open column, or of the board at the top.
+    in_header: bool,
     rendered_path: String,
     /// Displayed label back to the id it names, per level. `push_path` is handed
     /// the label the user was looking at, not an id.
@@ -316,7 +316,7 @@ impl ProjectManagementProvider {
         ProjectManagementProvider {
             board: Board::new(),
             open_column: None,
-            in_meta: false,
+            in_header: false,
             rendered_path: String::new(),
             labels: HashMap::new(),
             root_override: None,
@@ -366,7 +366,7 @@ impl ProjectManagementProvider {
     }
 
     pub fn at_root(&self) -> bool {
-        self.open_column.is_none() && !self.in_meta
+        self.open_column.is_none() && !self.in_header
     }
 
     pub fn needs_refresh(&self) -> bool {
@@ -488,30 +488,30 @@ impl ProjectManagementProvider {
         entry.insert(tags::strip_display(label), id);
     }
 
-    // ---- The list meta ----------------------------------------------------
+    // ---- The header ---------------------------------------------------------
 
-    /// The `list meta:` row's text.
+    /// The `header:` row's text.
     ///
     /// Localized, and therefore never literally `"meta"`: the app special-cases
     /// an Obj keyed exactly `"meta"` and skips `pop_path` when leaving it,
     /// which would leave this provider's path one segment deeper than the
     /// cursor.
-    fn meta_label() -> String {
-        localize::t("projectmanagement-list-meta")
+    fn header_label() -> String {
+        localize::t("projectmanagement-header")
     }
 
     /// Rows the app shows above the board's own in the list the cursor is on:
-    /// the cloud row (columns list, sync on) and the list meta. Every index the
+    /// the cloud row (columns list, sync on) and the header. Every index the
     /// app counts in `fetch()` rows is off by this much from a position in
     /// [`Board::columns`] or a column's cards.
     fn lead_rows(&self, columns_list: bool) -> usize {
         1 + usize::from(columns_list && self.cloud.is_enabled())
     }
 
-    /// Inside the list meta: the Merkle hash of the board (at the top) or of
+    /// Inside the header: the Merkle hash of the board (at the top) or of
     /// the open column, and, with cloud sync on, whether that is still what
     /// the last sync agreed on.
-    fn meta_children(&self) -> Vec<FfonElement> {
+    fn header_children(&self) -> Vec<FfonElement> {
         let (id, hash) = match self.open_column.and_then(|c| self.board.column(c)) {
             Some(c) => (Some(c.id), c.hash_hex()),
             None => (None, self.board.root_hash_hex()),
@@ -531,10 +531,10 @@ impl ProjectManagementProvider {
 
     /// The rows for the level the cursor is on.
     fn level_children(&mut self) -> Vec<FfonElement> {
-        // Before forgetting the level's labels: inside the meta the level is
+        // Before forgetting the level's labels: inside the header the level is
         // still the open column's, and its rows are wanted again on the way out.
-        if self.in_meta {
-            return self.meta_children();
+        if self.in_header {
+            return self.header_children();
         }
         let level = self.open_column;
         self.labels.remove(&level);
@@ -568,8 +568,8 @@ impl ProjectManagementProvider {
         {
             out.push(row);
         }
-        // Every list opens with its meta, the columns list included.
-        out.push(FfonElement::new_obj(Self::meta_label()));
+        // Every list opens with its header, the columns list included.
+        out.push(FfonElement::new_obj(Self::header_label()));
         for (id, text, is_column) in rows {
             let label = Self::row_label(id, &text);
             self.remember(level, &label, id);
@@ -601,7 +601,7 @@ impl ProjectManagementProvider {
             None => String::new(),
             Some(id) => format!("/c{id}"),
         };
-        self.rendered_path = if self.in_meta {
+        self.rendered_path = if self.in_header {
             format!("{column}/m")
         } else {
             column
@@ -627,7 +627,7 @@ impl ProjectManagementProvider {
         let rendered_only = [
             localize::t("projectmanagement-empty-columns"),
             localize::t("projectmanagement-empty-cards"),
-            Self::meta_label(),
+            Self::header_label(),
         ];
 
         // Which list is this? Not necessarily the one the cursor is on: undo and
@@ -1610,8 +1610,8 @@ impl Plugin for ProjectManagementProvider {
 
     fn sync_ffon_body_children(&mut self, children: &[FfonElement]) {
         self.ensure_loaded();
-        // The meta level holds rendered lines, not cards.
-        if self.in_meta {
+        // The header level holds rendered lines, not cards.
+        if self.in_header {
             return;
         }
         self.reconcile(children);
@@ -1622,8 +1622,8 @@ impl Plugin for ProjectManagementProvider {
             self.error = Some(localize::t("projectmanagement-error-unreadable"));
             return false;
         }
-        if old == Self::meta_label() {
-            self.error = Some(localize::t("projectmanagement-error-meta-readonly"));
+        if old == Self::header_label() {
+            self.error = Some(localize::t("projectmanagement-error-header-readonly"));
             return false;
         }
         // Remembered rather than applied: the app has not yet handed back the
@@ -1640,8 +1640,8 @@ impl Plugin for ProjectManagementProvider {
             self.error = Some(localize::t("projectmanagement-error-unreadable"));
             return false;
         }
-        if name == Self::meta_label() {
-            self.error = Some(localize::t("projectmanagement-error-meta-undeletable"));
+        if name == Self::header_label() {
+            self.error = Some(localize::t("projectmanagement-error-header-undeletable"));
             return false;
         }
         // The sync row is the switch's, in settings, not a column.
@@ -1653,14 +1653,14 @@ impl Plugin for ProjectManagementProvider {
     }
 
     fn push_path(&mut self, segment: &str) {
-        // The meta holds lines, nothing to descend into.
-        if self.in_meta {
+        // The header holds lines, nothing to descend into.
+        if self.in_header {
             return;
         }
         // Its own label first: no column can carry it, because every
         // translation ends in a colon and `column_title` strips one.
-        if segment == Self::meta_label() {
-            self.in_meta = true;
+        if segment == Self::header_label() {
+            self.in_header = true;
             self.sync_rendered_path();
             return;
         }
@@ -1670,7 +1670,7 @@ impl Plugin for ProjectManagementProvider {
             None
         };
         if column.is_none() && segment == "m" {
-            self.in_meta = true;
+            self.in_header = true;
             self.sync_rendered_path();
             return;
         }
@@ -1688,8 +1688,8 @@ impl Plugin for ProjectManagementProvider {
     }
 
     fn pop_path(&mut self) {
-        if self.in_meta {
-            self.in_meta = false;
+        if self.in_header {
+            self.in_header = false;
         } else {
             self.open_column = None;
         }
@@ -1711,24 +1711,24 @@ impl Plugin for ProjectManagementProvider {
     /// resolve the same way [`Self::push_path`] resolves them.
     fn set_current_path(&mut self, path: &str) {
         let mut seg = path.trim_start_matches('/');
-        // A trailing list meta, as its token (`/c3/m`) or its label.
-        let meta_label = Self::meta_label();
-        let mut in_meta = false;
-        for meta in ["m", meta_label.as_str()] {
-            if seg == meta {
+        // A trailing header, as its token (`/c3/m`) or its label.
+        let header_label = Self::header_label();
+        let mut in_header = false;
+        for header in ["m", header_label.as_str()] {
+            if seg == header {
                 seg = "";
-                in_meta = true;
+                in_header = true;
                 break;
             }
-            if let Some(rest) = seg.strip_suffix(meta).and_then(|r| r.strip_suffix('/')) {
+            if let Some(rest) = seg.strip_suffix(header).and_then(|r| r.strip_suffix('/')) {
                 seg = rest;
-                in_meta = true;
+                in_header = true;
                 break;
             }
         }
         if seg.is_empty() {
             self.open_column = None;
-            self.in_meta = in_meta;
+            self.in_header = in_header;
             self.sync_rendered_path();
             return;
         }
@@ -1745,7 +1745,7 @@ impl Plugin for ProjectManagementProvider {
             .or_else(|| seg.strip_prefix('c').and_then(|s| s.parse().ok()));
         if let Some(id) = resolved {
             self.open_column = Some(id);
-            self.in_meta = in_meta;
+            self.in_header = in_header;
             self.sync_rendered_path();
         }
     }
@@ -1754,7 +1754,7 @@ impl Plugin for ProjectManagementProvider {
     /// that list. Without this the app falls back to rebuilding the provider
     /// root, which misroutes a descended path and leaves the level empty.
     fn fetch_subtree_children(&mut self) -> Option<Vec<FfonElement>> {
-        if self.open_column.is_none() && !self.in_meta {
+        if self.open_column.is_none() && !self.in_header {
             return None;
         }
         self.ensure_loaded();
@@ -1771,8 +1771,8 @@ impl Plugin for ProjectManagementProvider {
     /// text, and no column is titled `c3`, so without this the descent stopped
     /// at the root and the tab reopened with the column closed.
     fn fetch_subtree_parent_key(&mut self) -> Option<String> {
-        if self.in_meta {
-            return Some(Self::meta_label());
+        if self.in_header {
+            return Some(Self::header_label());
         }
         let col = self.open_column?;
         self.ensure_loaded();
@@ -1901,7 +1901,7 @@ impl Plugin for ProjectManagementProvider {
         //
         // A title has no card index, so the board opens on that column's first
         // card. Anything else is left where it was, and so is a row above the
-        // columns (the cloud row, the list meta): the indices are the app's,
+        // columns (the cloud row, the header): the indices are the app's,
         // counted in `fetch()` rows, and those rows are not on the board.
         let lead = self.lead_rows(true);
         match std::mem::take(&mut self.entry_path).as_slice() {
@@ -2378,14 +2378,20 @@ mod tests {
     #[test]
     fn the_root_lists_the_columns_and_a_column_lists_its_cards() {
         let mut p = seeded();
-        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do", "Doing"]);
+        assert_eq!(
+            labels(&p.fetch()),
+            vec![header().as_str(), "To do", "Doing"]
+        );
         p.push_path("To do");
         assert_eq!(
             labels(&p.fetch()),
-            vec![meta().as_str(), "fix login", "write docs"]
+            vec![header().as_str(), "fix login", "write docs"]
         );
         p.pop_path();
-        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do", "Doing"]);
+        assert_eq!(
+            labels(&p.fetch()),
+            vec![header().as_str(), "To do", "Doing"]
+        );
     }
 
     #[test]
@@ -2396,7 +2402,7 @@ mod tests {
         assert!(p.fetch().iter().all(|e| e.is_obj()), "columns must be Obj");
         p.push_path("To do");
         let rows = p.fetch();
-        assert!(matches!(&rows[0], FfonElement::Obj(o) if o.key == meta()));
+        assert!(matches!(&rows[0], FfonElement::Obj(o) if o.key == header()));
         assert!(rows[1..].iter().all(|e| e.is_str()), "cards must be Str");
     }
 
@@ -2447,7 +2453,7 @@ mod tests {
         let mut p = seeded();
         descend(&mut p, "To do");
         let mut rows = p.fetch();
-        rows.remove(1); // row 0 is the list meta
+        rows.remove(1); // row 0 is the header
         p.sync_ffon_body_children(&rows);
         assert_eq!(cards(&p, 0), vec!["write docs"]);
     }
@@ -2478,7 +2484,7 @@ mod tests {
         let mut p = provider(&dir);
         p.ensure_loaded();
         assert_eq!(p.board.columns[0].title, "To do");
-        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do"]);
+        assert_eq!(labels(&p.fetch()), vec![header().as_str(), "To do"]);
     }
 
     #[test]
@@ -2594,7 +2600,7 @@ mod tests {
             p.sync_ffon_body_children(&rows);
         }
         let mut p = provider(&dir);
-        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do"]);
+        assert_eq!(labels(&p.fetch()), vec![header().as_str(), "To do"]);
     }
 
     #[test]
@@ -2604,7 +2610,7 @@ mod tests {
         let saved = p.current_path().to_owned();
         let mut fresh = seeded();
         fresh.set_current_path(&saved);
-        assert_eq!(labels(&fresh.fetch()), vec![meta().as_str(), "kanban ui"]);
+        assert_eq!(labels(&fresh.fetch()), vec![header().as_str(), "kanban ui"]);
     }
 
     /// The app also builds a path out of the display text of the row the cursor
@@ -2623,7 +2629,7 @@ mod tests {
         let _ = q.fetch();
         q.set_current_path("/Doing");
         assert_eq!(q.current_path(), walked);
-        assert_eq!(labels(&q.fetch()), vec![meta().as_str(), "kanban ui"]);
+        assert_eq!(labels(&q.fetch()), vec![header().as_str(), "kanban ui"]);
     }
 
     /// A column may be titled `c1`, and on a path this provider rendered itself
@@ -2637,7 +2643,7 @@ mod tests {
         p.set_current_path("/c4");
         assert_eq!(
             labels(&p.fetch()),
-            vec![meta().as_str(), "kanban ui"],
+            vec![header().as_str(), "kanban ui"],
             "column 4 is `Doing`"
         );
     }
@@ -2648,7 +2654,10 @@ mod tests {
         descend(&mut p, "Doing");
         p.set_current_path("/");
         assert!(p.at_root());
-        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "To do", "Doing"]);
+        assert_eq!(
+            labels(&p.fetch()),
+            vec![header().as_str(), "To do", "Doing"]
+        );
     }
 
     /// Staying put beats falling back to the board root, which is the one place
@@ -2745,7 +2754,7 @@ mod tests {
         let mut p = seeded();
         descend(&mut p, "To do");
         // The cursor is on the second card of the first column (each list
-        // opens with its meta row, so these are `fetch()` rows 1 and 2).
+        // opens with its header row, so these are `fetch()` rows 1 and 2).
         p.set_dashboard_entry(&[1, 2]);
         p.enter_dashboard();
         assert_eq!(p.focus, Focus { col: 0, row: 1 });
@@ -2755,7 +2764,7 @@ mod tests {
     fn from_a_column_title_the_board_opens_on_that_columns_first_card() {
         let mut p = seeded();
         // The cursor is on the second column's title, at the provider root,
-        // below the list meta.
+        // below the header.
         p.set_dashboard_entry(&[2]);
         p.enter_dashboard();
         assert_eq!(p.focus, Focus { col: 1, row: 0 });
@@ -3384,7 +3393,7 @@ mod tests {
 
         let mut fresh = provider(&dir);
         descend(&mut fresh, "To do");
-        assert_eq!(labels(&fresh.fetch()), vec![meta().as_str(), "ship it"]);
+        assert_eq!(labels(&fresh.fetch()), vec![header().as_str(), "ship it"]);
     }
 
     #[test]
@@ -3484,7 +3493,7 @@ mod tests {
         assert!(labels(&p.fetch()).iter().any(|l| l == "Archive"));
 
         descend(&mut p, "Archive");
-        assert_eq!(labels(&p.fetch()), vec![meta().as_str(), "fix login"]);
+        assert_eq!(labels(&p.fetch()), vec![header().as_str(), "fix login"]);
     }
 
     #[test]
@@ -4145,54 +4154,54 @@ mod tests {
         assert_eq!(theirs.half_gap_rows, ours.half_gap_rows);
     }
 
-    // ---- The list meta --------------------------------------------------
+    // ---- The header ---------------------------------------------------------
 
-    fn meta() -> String {
-        localize::t("projectmanagement-list-meta")
+    fn header() -> String {
+        localize::t("projectmanagement-header")
     }
 
-    /// Into the list meta of the level the cursor is on, as the app goes:
+    /// Into the header of the level the cursor is on, as the app goes:
     /// render, then push the label.
-    fn enter_meta(p: &mut ProjectManagementProvider) -> Vec<String> {
+    fn enter_header(p: &mut ProjectManagementProvider) -> Vec<String> {
         let _ = p.fetch();
-        p.push_path(&meta());
+        p.push_path(&header());
         labels(&p.fetch())
     }
 
     #[test]
-    fn every_list_opens_with_its_list_meta() {
+    fn every_list_opens_with_its_header() {
         let mut p = seeded();
         let root = p.fetch();
-        assert!(matches!(&root[0], FfonElement::Obj(o) if o.key == meta()));
+        assert!(matches!(&root[0], FfonElement::Obj(o) if o.key == header()));
         descend(&mut p, "To do");
         let cards = p.fetch();
-        assert!(matches!(&cards[0], FfonElement::Obj(o) if o.key == meta()));
+        assert!(matches!(&cards[0], FfonElement::Obj(o) if o.key == header()));
         assert!(cards[1..].iter().all(|e| e.is_str()), "cards stay Str");
     }
 
     #[test]
-    fn with_sync_on_the_meta_comes_right_below_the_cloud_row() {
+    fn with_sync_on_the_header_comes_right_below_the_cloud_row() {
         let mut p = seeded_with_cloud(active_licence());
         let rows = p.fetch();
         assert!(cloud::is_row(raw_of(&rows[0])));
-        assert_eq!(raw_of(&rows[1]), meta());
+        assert_eq!(raw_of(&rows[1]), header());
     }
 
     /// The board's root hash at the top, a column's own hash inside it: one
     /// glance says whether anything below has changed.
     #[test]
-    fn the_meta_shows_the_board_hash_at_the_top_and_the_column_hash_inside() {
+    fn the_header_shows_the_board_hash_at_the_top_and_the_column_hash_inside() {
         let mut p = seeded();
-        let top = enter_meta(&mut p);
+        let top = enter_header(&mut p);
         assert!(
             top.iter().any(|l| l.contains(&p.board.root_hash_hex())),
             "{top:?}"
         );
         p.pop_path();
-        assert!(p.at_root(), "out of the meta, back on the columns");
+        assert!(p.at_root(), "out of the header, back on the columns");
 
         descend(&mut p, "Doing");
-        let inside = enter_meta(&mut p);
+        let inside = enter_header(&mut p);
         assert!(
             inside
                 .iter()
@@ -4203,14 +4212,14 @@ mod tests {
         assert_eq!(
             p.current_path(),
             "/c4",
-            "out of the meta, still in the column"
+            "out of the header, still in the column"
         );
     }
 
     /// The one that would eat a board: the app hands back what it displayed,
-    /// meta row included.
+    /// header row included.
     #[test]
-    fn the_meta_row_is_never_stored() {
+    fn the_header_row_is_never_stored() {
         let mut p = seeded_with_cloud(Standing::Missing);
         let rows = p.fetch();
         p.sync_ffon_body_children(&rows);
@@ -4224,20 +4233,20 @@ mod tests {
     }
 
     #[test]
-    fn the_meta_row_cannot_be_deleted_or_edited() {
+    fn the_header_row_cannot_be_deleted_or_edited() {
         let mut p = seeded();
-        assert!(!p.delete_item(&meta()));
+        assert!(!p.delete_item(&header()));
         assert!(p.take_error().is_some());
-        assert!(!p.commit_edit(&meta(), "renamed"));
+        assert!(!p.commit_edit(&header(), "renamed"));
         assert!(p.take_error().is_some());
     }
 
-    /// The lines inside the meta are rendered, and an edit handed back from
+    /// The lines inside the header are rendered, and an edit handed back from
     /// there must not reach the board.
     #[test]
-    fn nothing_inside_the_meta_reaches_the_board() {
+    fn nothing_inside_the_header_reaches_the_board() {
         let mut p = seeded();
-        enter_meta(&mut p);
+        enter_header(&mut p);
         let before = p.board.clone();
         let lines = p.fetch();
         p.sync_ffon_body_children(&lines);
@@ -4245,9 +4254,9 @@ mod tests {
     }
 
     #[test]
-    fn the_meta_paths_round_trip_in_both_forms() {
+    fn the_header_paths_round_trip_in_both_forms() {
         let mut p = seeded();
-        enter_meta(&mut p);
+        enter_header(&mut p);
         assert_eq!(p.current_path(), "/m");
         assert!(!p.at_root());
 
@@ -4260,21 +4269,21 @@ mod tests {
         q.set_current_path("/c4/m");
         assert_eq!(q.current_path(), "/c4/m");
         q.pop_path();
-        assert_eq!(labels(&q.fetch()), vec![meta(), "kanban ui".to_owned()]);
+        assert_eq!(labels(&q.fetch()), vec![header(), "kanban ui".to_owned()]);
 
         let mut q = seeded();
         let _ = q.fetch();
-        q.set_current_path(&format!("/Doing/{}", meta()));
+        q.set_current_path(&format!("/Doing/{}", header()));
         assert_eq!(q.current_path(), "/c4/m");
     }
 
     /// The app counts the dashboard's entry path and `SelectPath` in `fetch()`
-    /// rows, the cloud row and the list meta included.
+    /// rows, the cloud row and the header included.
     #[test]
     fn the_board_skips_the_rows_above_the_columns_both_ways() {
         let mut p = seeded_with_cloud(active_licence());
-        // Cloud row, meta, To do, Doing: the cursor on "Doing", second card
-        // row (its meta first).
+        // Cloud row, header, To do, Doing: the cursor on "Doing", second card
+        // row (its header first).
         p.set_dashboard_entry(&[3, 1]);
         p.enter_dashboard();
         assert_eq!(p.focus, Focus { col: 1, row: 0 });
@@ -4283,7 +4292,7 @@ mod tests {
     }
 
     #[test]
-    fn entering_the_board_from_the_meta_row_leaves_the_focus_alone() {
+    fn entering_the_board_from_the_header_row_leaves_the_focus_alone() {
         let mut p = seeded();
         p.enter_dashboard();
         p.focus = Focus { col: 1, row: 0 };
@@ -4294,10 +4303,10 @@ mod tests {
         assert_eq!(p.focus, Focus { col: 1, row: 0 });
     }
 
-    /// The list meta says whether its list is as it was at the last sync,
+    /// The header says whether its list is as it was at the last sync,
     /// from the same Merkle hash it shows.
     #[test]
-    fn the_meta_says_whether_the_list_is_synced() {
+    fn the_header_says_whether_the_list_is_synced() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = provider_on(&dir, &host);
@@ -4306,7 +4315,7 @@ mod tests {
         p.board.columns.push(Column::new(1, "To do"));
         p.persist();
         let status = |p: &mut ProjectManagementProvider| {
-            let lines = enter_meta(p);
+            let lines = enter_header(p);
             p.pop_path();
             lines
         };
@@ -4332,9 +4341,9 @@ mod tests {
     }
 
     #[test]
-    fn no_sync_line_in_the_meta_while_sync_is_off() {
+    fn no_sync_line_in_the_header_while_sync_is_off() {
         let mut p = seeded();
-        let lines = enter_meta(&mut p);
+        let lines = enter_header(&mut p);
         assert_eq!(lines.len(), 1, "{lines:?}");
     }
 
