@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2
+
+- The header row reads header, kop, en-tête or Kopfzeile, without a colon.
+
 ## 0.4.1
 
 - The first row of every list is called header now (it was list meta). In Dutch it is kop, in French en-tête and in German Kopfzeile.

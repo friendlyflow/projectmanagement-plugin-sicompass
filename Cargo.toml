@@ -3,7 +3,7 @@
 
 [package]
 name = "projectmanagement-plugin"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Project management for sicompass: a kanban board in a list and on a grid, with optional cloud sync, as a plugin"
