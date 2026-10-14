@@ -16,7 +16,8 @@
   ],
   "service": {
     "tier": "friendlyflow/cloud",
-    "what": "projectmanagement-service"
+    "what": "projectmanagement-service",
+    "switch": "kanbanCloudBackup"
   },
   "permissions": {
     "storage": true,
