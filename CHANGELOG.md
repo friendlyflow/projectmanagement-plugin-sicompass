@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.3
+
+- The "enable cloud sync" checkbox shows only once you have Sicompass Cloud. Paying for it turns cloud sync on for your board, and you can still turn it off here.
+
 ## 0.4.2
 
 - The header row reads header, kop, en-tête or Kopfzeile, without a colon.
