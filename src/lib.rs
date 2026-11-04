@@ -473,7 +473,8 @@ impl ProjectManagementProvider {
 
     // ---- Row rendering --------------------------------------------------
 
-    /// A row: `<id>N</id><input>text</input>`.
+    /// A row: `<id>N</id><input>text</input>`. The text is escaped: `plugin.json`
+    /// says `"markup": true`, so the app reads tags out of every row.
     fn row_label(id: Id, text: &str) -> String {
         format!(
             "{}{}",
@@ -1628,8 +1629,10 @@ impl Plugin for ProjectManagementProvider {
         }
         // Remembered rather than applied: the app has not yet handed back the
         // list this row belongs to, and the row itself still carries its blank
-        // placeholder. `reconcile` picks this up when it does.
-        self.pending_create = Some(row_text(new));
+        // placeholder. `reconcile` picks this up when it does. `new` is what was
+        // typed, not a row: reading it as one would take `<input>y</input>` for
+        // a field and lose a backslash.
+        self.pending_create = Some(new.to_owned());
         true
     }
 
@@ -4230,6 +4233,219 @@ mod tests {
         let rows = p.fetch();
         p.sync_ffon_body_children(&rows);
         assert_eq!(cards(&p, 0), vec!["fix login", "write docs"]);
+    }
+
+    // ---- Markup -----------------------------------------------------------
+    //
+    // `plugin.json` says `"markup": true`, so the app reads the HTML-named tags
+    // and `<style>` rows in what this plugin sends. A column or a card is none
+    // of those.
+
+    /// Text that would be live if it reached a row as written.
+    const HOSTILE: [&str; 6] = [
+        "<b>x</b>",
+        r#"<img src="/etc/passwd">"#,
+        "<style>li { color: red }</style>",
+        "<input>y</input>",
+        "<button>go</button>",
+        r"ends in a backslash\",
+    ];
+
+    /// A field as the app writes it after the user types `text`: in a list of
+    /// markup it escapes what was typed (`handlers::typed_for_row`).
+    fn typed_field(text: &str) -> String {
+        tags::format_input(&tags::escape(text))
+    }
+
+    /// The raw row with this id.
+    fn row_with_id(p: &mut ProjectManagementProvider, id: Id) -> String {
+        p.fetch()
+            .iter()
+            .map(raw_of)
+            .find(|r| row_id(r) == Some(id))
+            .map(str::to_owned)
+            .expect("a row with that id")
+    }
+
+    fn assert_inert(raw: &str) {
+        assert!(!sicompass_sdk::markup::has_markup(raw), "markup in {raw}");
+        assert!(sicompass_sdk::markup::targets(raw).is_empty(), "{raw}");
+        assert!(tags::targets(raw).is_empty(), "{raw}");
+        assert!(!tags::has_button(raw), "{raw}");
+        assert!(!tags::has_link(raw), "{raw}");
+        assert!(!tags::has_image(raw), "{raw}");
+        assert!(sicompass_sdk::markup::style_sheet(raw).is_none(), "{raw}");
+    }
+
+    /// A board of one column, on disk, holding `title` and one card `text`.
+    fn board_of(d: &TempDir, title: &str, text: &str) -> ProjectManagementProvider {
+        let mut p = provider(d);
+        p.fetch();
+        p.board.columns.clear();
+        let mut column = Column::new(1, title);
+        column.cards.push(Card::new(2, text));
+        p.board.columns.push(column);
+        p.board.reseat_counter();
+        p.persist();
+        p
+    }
+
+    #[test]
+    fn the_manifest_asks_for_markup() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../plugin.json")).unwrap();
+        assert_eq!(manifest["markup"], serde_json::json!(true));
+    }
+
+    /// Every list row: the column's, and the card's inside it. The row is inert,
+    /// and what the edit field opens with is the original: the app fills it with
+    /// `strip_display(extract_input(row))`.
+    #[test]
+    fn hostile_text_in_a_column_and_a_card_stays_text() {
+        for text in HOSTILE {
+            let d = TempDir::new().unwrap();
+            let mut p = board_of(&d, text, text);
+
+            let column = row_with_id(&mut p, 1);
+            assert_inert(&column);
+            let field = tags::extract_input(&column).expect("the column's field");
+            assert_eq!(tags::strip_display(&field), text, "edit field of {column}");
+
+            // The app pushes what `strip_display` gives, whatever that is.
+            p.push_path(&tags::strip_display(&column));
+            assert_eq!(p.open_column, Some(1), "{column} could not be entered");
+
+            let card = row_with_id(&mut p, 2);
+            assert_inert(&card);
+            let field = tags::extract_input(&card).expect("the card's field");
+            assert_eq!(tags::strip_display(&field), text, "edit field of {card}");
+        }
+    }
+
+    /// Whole-row display, which goes through the `<id>` arm of `strip_display`.
+    /// Tags `strip_display` does not know come through as written.
+    #[test]
+    fn a_whole_row_shows_markup_shaped_text_as_written() {
+        for text in &HOSTILE[..3] {
+            let d = TempDir::new().unwrap();
+            let mut p = board_of(&d, text, "card");
+            let raw = row_with_id(&mut p, 1);
+            assert_eq!(tags::strip_display(&raw), *text, "{raw}");
+        }
+    }
+
+    /// A whole row with an `<id>` reads as what was typed, and stays inert.
+    #[test]
+    fn a_whole_row_with_an_id_reads_as_it_was_typed() {
+        for text in [
+            "<input>y</input>",
+            "<button>go</button>",
+            r"ends in a backslash\",
+            r"a\<b",
+        ] {
+            let d = TempDir::new().unwrap();
+            let mut p = board_of(&d, text, "card");
+            let raw = row_with_id(&mut p, 1);
+            assert_inert(&raw);
+            assert_eq!(tags::strip_display(&raw), text, "{raw}");
+            assert_eq!(p.board.columns[0].title, text, "stored intact");
+        }
+    }
+
+    #[test]
+    fn a_value_ending_in_a_backslash_is_an_input() {
+        let raw = ProjectManagementProvider::row_label(1, r"C:\board\");
+        assert!(tags::has_input(&raw), "{raw}");
+        assert_eq!(tags::extract_input(&raw).as_deref(), Some(r"C:\board\"));
+        assert_eq!(row_text(&raw), r"C:\board\");
+    }
+
+    /// Nothing typed, and the app hands the rows back: not one byte moves, here
+    /// or on disk, and no second round adds a backslash.
+    #[test]
+    fn handing_rows_back_never_changes_the_board() {
+        for text in HOSTILE.into_iter().chain([r"a\<b", r"\\<", r"a\>"]) {
+            let d = TempDir::new().unwrap();
+            let mut p = board_of(&d, text, text);
+            let hash = p.board.root_hash_hex();
+            for _ in 0..3 {
+                let rows = p.fetch();
+                p.sync_ffon_body_children(&rows);
+                assert_eq!(p.board.columns[0].title, text);
+            }
+            let column = row_with_id(&mut p, 1);
+            p.push_path(&tags::strip_display(&column));
+            for _ in 0..3 {
+                let rows = p.fetch();
+                p.sync_ffon_body_children(&rows);
+                assert_eq!(p.board.columns[0].cards[0].text, text);
+            }
+            assert_eq!(p.board.root_hash_hex(), hash);
+
+            let mut q = provider(&d);
+            q.fetch();
+            assert_eq!(q.board.columns[0].title, text, "column after a reload");
+            assert_eq!(
+                q.board.columns[0].cards[0].text, text,
+                "card after a reload"
+            );
+        }
+    }
+
+    /// An edit: `commit_edit` gets `old` as written and `new` as typed, and then
+    /// the list, the row rewritten the way the app rewrites it (prefix + field).
+    #[test]
+    fn editing_a_card_to_hostile_text_and_back_keeps_the_original_bytes() {
+        let d = TempDir::new().unwrap();
+        let mut p = board_of(&d, "To do", "plain");
+        descend(&mut p, "To do");
+        let mut previous = "plain".to_owned();
+        for text in HOSTILE.into_iter().chain(["plain"]) {
+            let raw = row_with_id(&mut p, 2);
+            let old = tags::extract_input(&raw).unwrap();
+            assert_eq!(old, tags::escape(&previous), "old is what was written");
+            assert!(p.commit_edit(&old, text));
+            let edited = format!("{}{}", tags::format_id("2"), typed_field(text));
+            p.sync_ffon_body_children(&[
+                FfonElement::new_obj(ProjectManagementProvider::header_label()),
+                FfonElement::Str(edited),
+            ]);
+            assert_eq!(cards(&p, 0), vec![text]);
+            previous = text.to_owned();
+        }
+    }
+
+    /// A new card from a row that still holds its blank placeholder: the text is
+    /// what `commit_edit` was handed, which is plain and is not a row, so `<input>`
+    /// in it is two words and a bracket.
+    #[test]
+    fn a_new_card_keeps_the_bytes_that_were_typed() {
+        for text in HOSTILE.into_iter().chain([r"a\<b"]) {
+            let d = TempDir::new().unwrap();
+            let mut p = board_of(&d, "To do", "first");
+            descend(&mut p, "To do");
+            assert!(p.commit_edit("", text));
+            let mut rows = p.fetch();
+            rows.push(FfonElement::Str(tags::format_input("")));
+            p.sync_ffon_body_children(&rows);
+            assert_eq!(cards(&p, 0), vec!["first", text]);
+        }
+    }
+
+    /// The same, for a column named on a row of its own.
+    #[test]
+    fn a_new_column_keeps_the_bytes_that_were_typed() {
+        for text in HOSTILE {
+            let d = TempDir::new().unwrap();
+            let mut p = board_of(&d, "To do", "first");
+            assert!(p.commit_edit("", &format!("{text}:")));
+            let mut rows = p.fetch();
+            rows.push(FfonElement::new_obj(typed_field(&format!("{text}:"))));
+            p.sync_ffon_body_children(&rows);
+            assert_eq!(p.board.columns.len(), 2);
+            let new = p.board.columns.iter().find(|c| c.id != 1).unwrap();
+            assert_eq!(new.title, text);
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The plugin kit (`plugin`) and the FFON model, from crates.io.
-sicompass-sdk = { version = "0.9.1", default-features = false, features = ["plugin"] }
+sicompass-sdk = { version = "0.9.12", default-features = false, features = ["plugin"] }
 # Cloud sync: the store's Merkle tree, the three-way merge, the sync protocol,
 # debouncing and the row. In the SDK repo, at an SDK release tag.
 sicompass-sync = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", tag = "v0.9.4" }
