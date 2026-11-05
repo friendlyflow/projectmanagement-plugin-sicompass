@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.5
+
+- A new card typed to look like a tag is stored and shown as typed.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
+
 ## 0.4.4
 
 - Installs as an update again. 0.4.3's release was packed by an older release tool that left the cloud sync switch out of its release description, so the Store refused it.
