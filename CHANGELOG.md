@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.6
+
+- A card being edited takes Ctrl+Left and Ctrl+Right to move by word, Ctrl+Backspace and Ctrl+Delete to delete a word, and Ctrl+Home and Ctrl+End for the start and end of the text, like every other field.
+
 ## 0.4.5
 
 - A new card typed to look like a tag is stored and shown as typed.

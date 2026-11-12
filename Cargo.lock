@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "projectmanagement-plugin"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -805,9 +805,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sicompass-sdk"
-version = "0.9.14"
+version = "0.9.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe3b52b80287c856a9875656cc099999bfb4203a38604c0278d57f7539827aa5"
+checksum = "451ab812e9341429b6382db88c660bc1a903c1b344eac26f4480db413374bf6b"
 dependencies = [
  "async-trait",
  "libc",
