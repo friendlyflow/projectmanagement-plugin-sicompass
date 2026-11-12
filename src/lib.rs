@@ -2095,6 +2095,31 @@ impl ProjectManagementProvider {
                 self.commit_edit_state();
                 true
             }
+            // By word and to the ends of the whole text, the app's own keys.
+            K::Backspace if key.ctrl => {
+                self.edit_with(|f, _| f.delete_word_back());
+                true
+            }
+            K::Delete if key.ctrl => {
+                self.edit_with(|f, _| f.delete_word_forward());
+                true
+            }
+            K::Left if key.ctrl => {
+                self.edit_with(|f, _| f.word_left(false));
+                true
+            }
+            K::Right if key.ctrl => {
+                self.edit_with(|f, _| f.word_right(false));
+                true
+            }
+            K::Home if key.ctrl => {
+                self.edit_with(|f, _| f.text_home(false));
+                true
+            }
+            K::End if key.ctrl => {
+                self.edit_with(|f, _| f.text_end(false));
+                true
+            }
             K::Backspace => {
                 self.backspace();
                 true
@@ -3129,6 +3154,25 @@ mod tests {
         p.dashboard_text("new ");
         p.dashboard_key(key(Keysym::Enter));
         assert_eq!(cards(&p, 1), vec!["new kanban ui"]);
+    }
+
+    #[test]
+    fn ctrl_keys_edit_a_card_by_word_and_by_the_whole_text() {
+        let mut p = seeded();
+        p.enter_dashboard();
+        p.focus = Focus { col: 1, row: 0 };
+        // "kanban ui", caret at the end.
+        p.dashboard_key(key(Keysym::Ch('a')));
+        p.dashboard_key(ctrl(Keysym::Backspace));
+        p.dashboard_key(ctrl(Keysym::Left));
+        p.dashboard_text("new ");
+        p.dashboard_key(ctrl(Keysym::End));
+        p.dashboard_text("board");
+        p.dashboard_key(ctrl(Keysym::Home));
+        p.dashboard_key(ctrl(Keysym::Right));
+        p.dashboard_key(ctrl(Keysym::Delete));
+        p.dashboard_key(key(Keysym::Enter));
+        assert_eq!(cards(&p, 1), vec!["new board"]);
     }
 
     #[test]
